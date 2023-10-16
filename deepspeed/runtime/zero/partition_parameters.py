@@ -243,10 +243,11 @@ def zero_wrapper_for_fp_tensor_constructor(fn: Callable, target_fp_dtype: torch.
     def wrapped_fn(*args, **kwargs) -> Tensor:
         if kwargs.get("device", None) is None:
             kwargs['device'] = torch.device(get_accelerator().device_name(os.environ["LOCAL_RANK"]))
+        if kwargs['device'].type == "hpu":
+            kwargs["dtype"] = target_fp_dtype
         tensor: Tensor = fn(*args, **kwargs)
-        if tensor.is_floating_point():
+        if tensor.is_floating_point() and tensor.dtype != target_fp_dtype:
             tensor = tensor.to(target_fp_dtype)
-
         return tensor
 
     return wrapped_fn
