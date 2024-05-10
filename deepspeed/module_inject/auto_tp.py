@@ -300,8 +300,6 @@ class AutoTP():
                 elif 'self_attention.dense' in layer and 'falcon' in str(
                         type(module)):  # this is a hack to get the right linear layer for this model!
                     gem_list = gem_list + [layer]
-                elif 'w2' in layer and 'mixtral' in str(type(module)):
-                    gem_list = gem_list + [layer]
 
             layer_list = []
             if gem_list != []:
@@ -360,20 +358,31 @@ class AutoTP():
                     prepare_tp_fused_qkvw(module_str, child.bias.data, self.mp_size, mp_replace.gpu_index),
                     get_accelerator().current_device_name())
             else:
-                data = child.weight.data.split(get_shard_size_list(weight_shape[0], self.mp_size),
-                                               dim=1 if self.conv_linear_layer else 0)
-                data_dc = move(data[mp_replace.gpu_index], get_accelerator().current_device_name()).detach()
-                del data
+                if 'gate' in name and 'mixtral' in str(type(self.module)):
+                    data_dc = child.weight.data
+                    bias_data_dc = None if child.bias is None else child.bias.data
 
-                if child.bias is not None:
-                    bias_data = child.bias.data.split(get_shard_size_list(
-                        weight_shape[1] if self.conv_linear_layer else weight_shape[0], self.mp_size),
-                                                      dim=0)
-                    bias_data = move(bias_data[mp_replace.gpu_index], get_accelerator().current_device_name())
-                    bias_data_dc = torch.nn.parameter.Parameter(bias_data, requires_grad=False)
-                    del bias_data
+                elif 'w2' in name and 'mixtral' in str(type(self.module)):
+                    data = child.weight.data.split(get_shard_size_list(weight_shape[1], self.mp_size), dim=1)
+                    data_dc = move(data[mp_replace.gpu_index], get_accelerator().current_device_name()).detach()
+                    del data
+                    bias_data_dc = None if child.bias is None else \
+                        torch.nn.parameter.Parameter(move(child.bias, get_accelerator().current_device_name()))
+
                 else:
-                    bias_data_dc = None
+                    data = child.weight.data.split(get_shard_size_list(weight_shape[0], self.mp_size),
+                                               dim=1 if self.conv_linear_layer else 0)
+                    data_dc = move(data[mp_replace.gpu_index], get_accelerator().current_device_name()).detach()
+                    del data
+                    if child.bias is not None:
+                        bias_data = child.bias.data.split(get_shard_size_list(
+                            weight_shape[1] if self.conv_linear_layer else weight_shape[0], self.mp_size),
+                                                      dim=0)
+                        bias_data = move(bias_data[mp_replace.gpu_index], get_accelerator().current_device_name())
+                        bias_data_dc = torch.nn.parameter.Parameter(bias_data, requires_grad=False)
+                        del bias_data
+                    else:
+                        bias_data_dc = None
 
             setattr(child, "replaced", True)
             return LinearLayer(weight=torch.nn.parameter.Parameter(data_dc, requires_grad=False), bias=bias_data_dc)
