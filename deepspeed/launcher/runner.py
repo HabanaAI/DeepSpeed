@@ -497,6 +497,15 @@ def main(args=None):
         update_wa_env_var("PT_HPU_ENABLE_REFINE_DYNAMIC_SHAPES", "0")
         # todo SW-145489: remove WEIGHT CPU PERMUTE WA after SW-145491 is resolved
         update_wa_env_var("PT_HPU_ENABLE_WEIGHT_CPU_PERMUTE", "0")
+        # determine available modules 
+        try:
+            hl_smi = subprocess.check_output(['hl-smi', "-L"])
+            num_accelerators = re.findall(r"Module ID\s+:\s+(\d+)", hl_smi.decode())
+        except FileNotFoundError:
+            sim_list = subprocess.check_output(['ls', '-1', '/dev/accel'])
+            num_accelerators = re.findall(r"accel(\d+)", sim_list.decode())
+            num_accelerators = sorted(num_accelerators, key=int)
+        update_wa_env_var("HABANA_VISIBLE_MODULES", ",".join(num_accelerators))
 
     # encode world info as base64 to make it easier to pass via command line
     world_info_base64 = encode_world_info(active_resources)
