@@ -8,18 +8,18 @@ from deepspeed.ops.op_builder import CPUAdamBuilder
 
 from unit.common import DistributedTest
 from unit.simple_model import *
-
 from unit.checkpoint.common import checkpoint_correctness_verification
-
+from deepspeed.accelerator import get_accelerator
 import pytest
 
 
+@pytest.mark.parametrize('compile_mode', [True, False])
 @pytest.mark.parametrize('zero_stage, use_cpu_offload', [(0, False), (1, False), (2, False), (2, True), (3, False),
                                                          (3, True)])
 class TestLRSchedulerCheckpoint(DistributedTest):
     world_size = 2
 
-    def test_checkpoint_lr_scheduler(self, tmpdir, zero_stage, use_cpu_offload):
+    def test_checkpoint_lr_scheduler(self, tmpdir, zero_stage, use_cpu_offload, compile_mode):
         if use_cpu_offload and not deepspeed.ops.__compatible_ops__[CPUAdamBuilder.NAME]:
             pytest.skip("cpu-adam is not compatible")
 
@@ -49,14 +49,20 @@ class TestLRSchedulerCheckpoint(DistributedTest):
                     "warmup_max_lr": 0.001,
                     "warmup_num_steps": 1000
                 }
+            },
+            "compile": {
+                "enabled": compile_mode,
+                "backend": get_accelerator().get_compile_backend()
             }
         }
         hidden_dim = 10
+        fp16 = True
+        zero3_init_dtype = None
 
         if zero_stage == 3:
             global DeepSpeedZeroOptimizer_Stage3
             from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
-            with deepspeed.zero.Init():
+            with deepspeed.zero.Init(dtype=zero3_init_dtype):
                 models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
         else:
             models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
@@ -66,9 +72,10 @@ class TestLRSchedulerCheckpoint(DistributedTest):
                                             hidden_dim,
                                             tmpdir,
                                             load_optimizer_states=False,
-                                            load_lr_scheduler_states=True)
+                                            load_lr_scheduler_states=True,
+                                            fp16=fp16)
 
-    def test_checkpoint_no_lr_scheduler(self, tmpdir, zero_stage, use_cpu_offload):
+    def test_checkpoint_no_lr_scheduler(self, tmpdir, zero_stage, use_cpu_offload, compile_mode):
         if use_cpu_offload and not deepspeed.ops.__compatible_ops__[CPUAdamBuilder.NAME]:
             pytest.skip("cpu-adam is not compatible")
 
@@ -96,11 +103,18 @@ class TestLRSchedulerCheckpoint(DistributedTest):
                     "warmup_num_steps": 1000
                 }
             },
+            "compile": {
+                "enabled": compile_mode,
+                "backend": get_accelerator().get_compile_backend()
+            }
         }
         hidden_dim = 10
 
+        fp16 = True
+        zero3_init_dtype = None
+
         if zero_stage == 3:
-            with deepspeed.zero.Init():
+            with deepspeed.zero.Init(dtype=zero3_init_dtype):
                 models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
         else:
             models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
@@ -110,4 +124,5 @@ class TestLRSchedulerCheckpoint(DistributedTest):
                                             hidden_dim,
                                             tmpdir,
                                             load_optimizer_states=False,
-                                            load_lr_scheduler_states=False)
+                                            load_lr_scheduler_states=False,
+                                            fp16=fp16)

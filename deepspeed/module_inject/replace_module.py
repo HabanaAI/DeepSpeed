@@ -202,7 +202,9 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
     micro_batch_size = -1
     seed = -1
     local_rank = -1
-
+    # TODO SW-170491: remove the below WA once SW-170491 is resolved.
+    llama_large_seq_perf_workaround = os.getenv("DEEPSPEED_LLAMA_LARGE_SEQ_PERF_WORKAROUND",
+                                                "0").lower() in ["1", "true"]
     mp_replace = ReplaceWithTensorSlicing(mp_group=config.tensor_parallel.tp_group,
                                           mp_size=config.tensor_parallel.tp_size)  #, out_dim=0, in_dim=1)
 
@@ -336,7 +338,8 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
             module = replace_wo_policy(module, ("embed_out", ), 0, "embed_out")
         return module
 
-    if checkpoint_dict is not None and not config.replace_with_kernel_inject:
+    # TODO SW-170491: remove the below WA once SW-170491 is resolved.
+    if not llama_large_seq_perf_workaround and checkpoint_dict is not None and not config.replace_with_kernel_inject:
         # AutoTP shard loading
         checkpoint = checkpoint_dict["checkpoints"]
         pbar = tqdm.tqdm(total=len(checkpoint), desc=f"Loading {len(checkpoint)} checkpoint shards")
@@ -359,9 +362,11 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
     quantizer = GroupQuantizer(q_int8=quantize)
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     rank = dist.get_rank() if dist.is_initialized() else 0
-    if checkpoint_dict is not None and config.replace_with_kernel_inject:
-        assert container_g.ckpt_load_enabled, \
-               f"Meta Tensor checkpoint loading not supported in {container_g.__class__.__name__} container"
+    # TODO SW-170491: remove the below WA once SW-170491 is resolved.
+    if checkpoint_dict is not None and (config.replace_with_kernel_inject or llama_large_seq_perf_workaround):
+        if not llama_large_seq_perf_workaround or get_accelerator().device_name() != "hpu":
+            assert container_g.ckpt_load_enabled, \
+                   f"Meta Tensor checkpoint loading not supported in {container_g.__class__.__name__} container"
         start_time = time.time()
         checkpoint = checkpoint_dict['checkpoints']
         ckpt_list = checkpoint["tp"] if type(checkpoint) is dict else checkpoint

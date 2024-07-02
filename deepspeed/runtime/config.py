@@ -169,6 +169,12 @@ def get_bfloat16_enabled(param_dict):
     return False
 
 
+def get_fp8_optimizer_enabled(param_dict):
+    if FP8_OPTIMIZER in param_dict.keys():
+        return get_scalar_param(param_dict[FP8_OPTIMIZER], FP8_OPTIMIZER_ENABLED, FP8_OPTIMIZER_ENABLED_DEFAULT)
+    return FP8_OPTIMIZER_ENABLED_DEFAULT
+
+
 def get_bfloat16_immediate_grad_update(param_dict):
     for key in [BFLOAT16, BFLOAT16_OLD]:
         if key in param_dict.keys():
@@ -508,6 +514,10 @@ def get_zero_force_ds_cpu_optimizer(param_dict):
     return get_scalar_param(param_dict, ZERO_FORCE_DS_CPU_OPTIMIZER, ZERO_FORCE_DS_CPU_OPTIMIZER_DEFAULT)
 
 
+def get_zero_allow_comm_data_type_fp32(param_dict):
+    return get_scalar_param(param_dict, ZERO_ALLOW_COMM_DATA_TYPE_FP32, ZERO_ALLOW_COMM_DATA_TYPE_FP32_DEFAULT)
+
+
 def get_scheduler_name(param_dict):
     if SCHEDULER in param_dict.keys() and TYPE in param_dict[SCHEDULER].keys():
         return param_dict[SCHEDULER][TYPE]
@@ -829,6 +839,7 @@ class DeepSpeedConfig(object):
         self.bfloat16_immediate_grad_update = get_bfloat16_immediate_grad_update(param_dict)
         assert not (self.fp16_enabled
                     and self.bfloat16_enabled), 'bfloat16 and fp16 modes cannot be simultaneously enabled'
+        self.fp8_optimizer_enabled = get_fp8_optimizer_enabled(param_dict)
         self.fp16_master_weights_and_gradients = get_fp16_master_weights_and_grads_enabled(param_dict)
         self.amp_enabled = get_amp_enabled(param_dict)
         self.amp_params = get_amp_params(param_dict)

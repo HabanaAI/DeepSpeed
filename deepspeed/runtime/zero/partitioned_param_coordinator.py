@@ -125,7 +125,7 @@ class PartitionedParameterCoordinator:
         # mechanism which doesn't require any configuration by the user.
         self.__ongoing_fetch_events: Deque[get_accelerator().Event] = collections.deque()
         # TODO. make this configurable via JSON
-        self.__max_ongoing_fetch_events: int = 2
+        self.__max_ongoing_fetch_events: int = 2 if get_accelerator().device_name() != "hpu" else -1
         self.__profiler = PartitionedParameterProfiler(timers if ENABLE_PROFILER else None)
 
     """Tracing and Tracking
@@ -303,7 +303,7 @@ class PartitionedParameterCoordinator:
                 with get_accelerator().stream(self.__allgather_stream):
                     while self.__ongoing_fetch_events and self.__ongoing_fetch_events[0].query():
                         self.__ongoing_fetch_events.popleft()
-                    if len(self.__ongoing_fetch_events) > self.__max_ongoing_fetch_events:
+                    if len(self.__ongoing_fetch_events) > self.__max_ongoing_fetch_events > -1:
                         self.__ongoing_fetch_events.popleft().synchronize()
 
                     self.__inflight_param_registry.pop(param).wait()
@@ -392,7 +392,7 @@ class PartitionedParameterCoordinator:
 
     @instrument_w_nvtx
     @torch.no_grad()
-    def release_sub_module(self, submodule: Module) -> None:
+    def release_sub_module(self, submodule: Module, backward: bool) -> None:
         """release the parameters of a sub module, assuming they meet conditions to
         be released."""
         params_to_release = (self.__params_to_release(submodule, self.__step_id) if self.is_complete_trace() else set(
@@ -400,7 +400,7 @@ class PartitionedParameterCoordinator:
         for param in iter_params(submodule, recurse=z3_leaf_module(submodule)):
             param.ds_active_sub_modules.discard(submodule.id)
             if param.ds_id in params_to_release and not param.is_external_param:
-                self.__release_param(param)
+                self.__release_param(param, backward)
 
     @instrument_w_nvtx
     @torch.no_grad()
@@ -413,7 +413,7 @@ class PartitionedParameterCoordinator:
             # TODO. make this throw if if there are still active submodules. currently
             # there's a hook execution issue
             param.ds_active_sub_modules.clear()
-            self.__release_param(param)
+            self.__release_param(param, backward=False)
 
         for param in iter_params(module, recurse=True):
             if param.ds_status != ZeroParamStatus.NOT_AVAILABLE:
@@ -444,27 +444,19 @@ class PartitionedParameterCoordinator:
                 all_gather_numel += param.ds_numel
 
         if partitioned_params:
+            partitioned_params
             self.__n_available_params += all_gather_numel
-            # here we need to handle a special case where some of the parameters have a valid hpz secondary tensor (e.g. they are not trainable so their secondary tensor never expire) but others do not.
-            partitioned_params_with_secondary_tensors = [
-                p for p in partitioned_params if p.ds_secondary_tensor is not None
-            ]
-            partitioned_params_without_secondary_tensors = [
-                p for p in partitioned_params if p.ds_secondary_tensor is None
-            ]
-            for param_group in [
-                    partitioned_params_with_secondary_tensors, partitioned_params_without_secondary_tensors
-            ]:
-                if not param_group:
-                    continue
-                with get_accelerator().stream(self.__allgather_stream):
-                    event_name = __class__.FORWARD_ALL_GATHER if forward else __class__.BACKWARD_ALL_GATHER
-                    self.__profiler.start_event(event_name)
-                    handle = param_group[0].all_gather_coalesced(param_group, quantize=quantize)
-                    self.__profiler.stop_event(event_name, all_gather_numel)
-                for param in param_group:
-                    assert param.ds_status == ZeroParamStatus.INFLIGHT, param.ds_summary()
-                    self.__inflight_param_registry[param] = handle
+            with get_accelerator().stream(self.__allgather_stream):
+                event_name = __class__.FORWARD_ALL_GATHER if forward else __class__.BACKWARD_ALL_GATHER
+                self.__profiler.start_event(event_name)
+                handle = partitioned_params[0].all_gather_coalesced(partitioned_params,
+                                                                    forward=forward,
+                                                                    quantize=quantize)
+                self.__profiler.stop_event(event_name, all_gather_numel)
+
+            for param in partitioned_params:
+                assert param.ds_status == ZeroParamStatus.INFLIGHT, param.ds_summary()
+                self.__inflight_param_registry[param] = handle
 
             # Release swap buffers for persisted params on nvme since they will never be partitioned or evicted from GPU
             swap_persisted_params = [
@@ -475,11 +467,11 @@ class PartitionedParameterCoordinator:
 
     @compiler.disable
     @instrument_w_nvtx
-    def __release_param(self, param: Parameter) -> None:
+    def __release_param(self, param: Parameter, backward: bool) -> None:
         if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
             if logger.isEnabledFor(logging.DEBUG):
                 debug_rank0(f"-release: {param.ds_summary()}")
-            param.partition()
+            param.partition(backward=backward)
             self.__n_available_params -= param.ds_numel
 
     @instrument_w_nvtx

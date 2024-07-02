@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from deepspeed.utils import groups, log_dist
 from .experts import Experts
 from .sharded_moe import MOELayer, TopKGate
+from deepspeed.accelerator import get_accelerator
 
 
 class MoE(nn.Module):
@@ -61,7 +62,8 @@ class MoE(nn.Module):
         self.expert_group_name = f"ep_size_{self.ep_size}"
         self.num_experts = num_experts
         self.num_local_experts = num_experts // self.ep_size
-
+        #TODO SW-179530: remove workaround when issue with lazy is resolved (see SW-179530).
+        expert.to(get_accelerator().device_name())
         log_dist(
             f'Creating MoE layer with num_experts: {num_experts} | num_local_experts: {self.num_local_experts} | expert_parallel_size: {self.ep_size}',
             [0])
@@ -71,7 +73,7 @@ class MoE(nn.Module):
 
         experts = Experts(expert, self.num_local_experts, self.expert_group_name)
         self.deepspeed_moe = MOELayer(TopKGate(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
-                                               min_capacity, noisy_gate_policy, drop_tokens, use_rts,
+                                               min_capacity, noisy_gate_policy, drop_tokens, use_rts, None,
                                                top2_2nd_expert_sampling),
                                       experts,
                                       self.expert_group_name,

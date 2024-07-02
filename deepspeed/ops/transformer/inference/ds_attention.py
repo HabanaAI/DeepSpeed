@@ -89,7 +89,7 @@ class DeepSpeedSelfAttention(nn.Module):
                 torch.empty(self.hidden_size_per_partition * 3, dtype=data_type_fp, device=device)
             ]
 
-    def compute_attention(self, qkv_out, input_mask, layer_past, alibi):
+    def compute_attention(self, qkv_out, input_mask, layer_past, alibi, is_prompt, token_idx, position_ids):
         if isinstance(qkv_out, list) or isinstance(qkv_out, tuple):
             qkv_out = qkv_out[0]
 
@@ -108,7 +108,10 @@ class DeepSpeedSelfAttention(nn.Module):
             no_masking=no_masking,
             layer_id=self.config.layer_id,
             num_layers=DeepSpeedSelfAttention.num_layers,
-            alibi=alibi)
+            alibi=alibi,
+            is_prompt=is_prompt,
+            token_idx=token_idx,
+            position_ids=position_ids)
 
         context_layer, key_layer, value_layer = attn_key_value
         return context_layer, key_layer, value_layer
@@ -136,7 +139,8 @@ class DeepSpeedSelfAttention(nn.Module):
                 output_attentions=False,
                 norm_w=None,
                 norm_b=None,
-                alibi=None):
+                alibi=None,
+                **kwargs):
         if self.attn_qkvw is None:
             self._attn_qkvw, self._attn_qkvb = self._merge_qkv()
         else:
@@ -157,10 +161,17 @@ class DeepSpeedSelfAttention(nn.Module):
                                     gamma=norm_w,
                                     beta=norm_b)
 
+        is_prompt = kwargs.get("first_token", qkv_out[0].shape[1] > 1)
+        token_idx = kwargs.get("token_idx", None)
+        position_ids = kwargs.get("position_ids", None)
+
         context_layer, key_layer, value_layer = self.compute_attention(qkv_out=qkv_out,
                                                                        input_mask=input_mask,
                                                                        layer_past=layer_past,
-                                                                       alibi=alibi)
+                                                                       alibi=alibi,
+                                                                       is_prompt=is_prompt,
+                                                                       token_idx=token_idx,
+                                                                       position_ids=position_ids)
 
         output = self.vector_matmul_func(input=context_layer, weight=self.attn_ow)
         inp_norm = qkv_out[-1]
@@ -210,7 +221,7 @@ class BloomSelfAttention(DeepSpeedSelfAttention):
 
         return tensor_list
 
-    def compute_attention(self, qkv_out, input_mask, layer_past, alibi):
+    def compute_attention(self, qkv_out, input_mask, layer_past, alibi, is_prompt, token_idx, position_ids):
         if isinstance(qkv_out, list) or isinstance(qkv_out, tuple):
             qkv_out = qkv_out[0]
 
@@ -246,8 +257,10 @@ class BloomSelfAttention(DeepSpeedSelfAttention):
         matmul_result = torch.matmul(query_layer, key_layer)
         # change view to [batch_size, num_heads, q_length, k_length]
         attention_scores = matmul_result.view(output_size[0], output_size[1], output_size[2], -1)
-
-        offset = dist.get_rank() * self.num_attention_heads_per_partition if dist.is_initialized() else 0
+        if self.config.mp_size > 1 and dist.is_initialized():
+            offset = dist.get_rank() * self.num_attention_heads_per_partition
+        else:
+            offset = 0
         target_dtype = torch.float16 if self.config.dtype == torch.int8 else self.config.dtype
 
         # When using the hybrid engine with BLOOM, input_mask needs to be converted from torch.bool -> torch.int64
@@ -255,7 +268,7 @@ class BloomSelfAttention(DeepSpeedSelfAttention):
             input_mask = input_mask.long()
 
         attention_probs = self.softmax_func(attn_scores=attention_scores,
-                                            attn_mask=((1 - input_mask).to(target_dtype) * minus_inf),
+                                            attn_mask=input_mask.to(target_dtype) * minus_inf,
                                             alibi=alibi,
                                             triangular=(self.config.triangular_masking
                                                         and (attention_scores.shape[-2] > 1)),

@@ -20,6 +20,7 @@ ZeRO optimization should be enabled as:
     "stage": [0|1|2],
     "stage3_max_live_parameters" : 1000000000,
     "stage3_max_reuse_distance" : 1000000000,
+    "stage3_use_all_reduce_for_fetch_params": [true|false],
     "allgather_partitions": [true|false],
     "use_multi_rank_bucket_allreduce": [true|false],
     "allgather_bucket_size": 500000000,
@@ -197,7 +198,10 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     ZeRO3-Offload, ZeRO-Infinity, and ZeRO-Inference.
     """
 
-    param_persistence_threshold: int = Field(pp_int(1e5), ge=0, alias="stage3_param_persistence_threshold")
+    #WA for SW-148986. Set param_persistence_threshold to 0 for zero inf
+    param_persistence_threshold: int = Field(
+        None, alias="stage3_param_persistence_threshold"
+    )  # None for dynamic default value (see validator `param_persistence_threshold_valid` below)
     """
     Do not partition parameters smaller than this threshold. Smaller values use
     less memory, but can greatly increase communication (especially
@@ -238,6 +242,12 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
                                                            deprecated=True,
                                                            new_param="gather_16bit_weights_on_model_save")
     """ Deprecated, please use ``gather_16bit_weights_on_model_save`` """
+
+    use_all_reduce_for_fetch_params: bool = Field(False, alias="stage3_use_all_reduce_for_fetch_params")
+    """
+    Use all_reduce op when fetching module parameters at stage3. This allows to significantly improve
+    performance by reducing the overhead of concatenation and slicing on the host.
+    """
 
     ignore_unused_parameters: bool = True
     """
@@ -315,3 +325,14 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
         if offload_config and offload_config.ratio < 1.0:
             assert values.get("stage") == ZeroStageEnum.weights, "Partial offloading only supported for ZeRO Stage 3."
         return values
+
+    @validator("param_persistence_threshold")
+    def param_persistence_threshold_valid(cls, field_value, values):
+        if field_value is None:
+            assert (
+                "offload_param"
+                in values), "DeepSpeedZeroConfig: 'offload_param' must be defined before 'param_persistence_threshold'"
+            field_value = pp_int(1e5)
+            if values["offload_param"] is not None and values["offload_param"].device != OffloadDeviceEnum.none:
+                field_value = 0
+        return field_value

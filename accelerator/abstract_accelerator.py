@@ -281,6 +281,10 @@ class DeepSpeedAccelerator(ABC):
         ...
 
     @abc.abstractmethod
+    def get_compile_backend(self):
+        ...
+
+    @abc.abstractmethod
     def build_extension(self):
         ...
 

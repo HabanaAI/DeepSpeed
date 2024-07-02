@@ -15,6 +15,7 @@ from deepspeed.utils import safe_get_full_grad
 import numpy.testing as npt
 from unit.common import DistributedTest
 from deepspeed.ops.op_builder import InferenceBuilder
+from deepspeed.accelerator import get_accelerator
 
 if not deepspeed.ops.__compatible_ops__[InferenceBuilder.NAME]:
     pytest.skip("This op had not been implemented on this system.", allow_module_level=True)
@@ -119,13 +120,17 @@ def only_optimize_lora_parameters(model):
 class TestHybridEngineLoRA(DistributedTest):
     world_size = 1
 
-    def get_model(self, model_name):
+    def get_model(self, model_name, replace_fp16_to_bf16=False):
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
         model_config = AutoConfig.from_pretrained(model_name)
         model_config.dropout = 0.0
         model = AutoModelForCausalLM.from_pretrained(model_name, config=model_config)
-        model = model.half()
-        model = model.to(f'cuda:{local_rank}')
+        if replace_fp16_to_bf16:
+            model = model.bfloat16()
+        else:
+            model = model.half()
+        device = get_accelerator().device_name()
+        model = model.to(f'{device}:{local_rank}')
         return model
 
     def get_tokenizer(self, model_name):
@@ -146,8 +151,9 @@ class TestHybridEngineLoRA(DistributedTest):
             raise NotImplementedError(f"batch_size {batch_size} not implemented")
 
     def test_lora(self, batch_size, model_name, zero_stage, offload_device):
+        replace_fp16_to_bf16 = False
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
-        model = self.get_model(model_name)
+        model = self.get_model(model_name, replace_fp16_to_bf16)
         tokenizer = self.get_tokenizer(model_name)
         train_sentences = self.get_train_sentences(batch_size)
 
@@ -180,6 +186,9 @@ class TestHybridEngineLoRA(DistributedTest):
             }
         }
 
+        if replace_fp16_to_bf16:
+            ds_config["fp16"]["enabled"] = False
+            ds_config["bf16"] = {"enabled": True}
         model, *_ = deepspeed.initialize(model=model, config=ds_config)
 
         # Verify gradient norm is larger than 0
@@ -190,7 +199,8 @@ class TestHybridEngineLoRA(DistributedTest):
 
         model.train()
         batch = tokenizer(train_sentences, max_length=16, padding="max_length", truncation=True, return_tensors="pt")
-        batch = to_device(batch, f'cuda:{local_rank}')
+        device = get_accelerator().device_name()
+        batch = to_device(batch, f'{device}:{local_rank}')
         batch["labels"] = batch["input_ids"]
         outputs = model(**batch, use_cache=False)
         loss = outputs.loss

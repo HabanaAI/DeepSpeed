@@ -34,6 +34,7 @@ from deepspeed.runtime.zero.config import ZERO_OPTIMIZATION
 from deepspeed.runtime.fp16.fused_optimizer import FP16_Optimizer
 from deepspeed.runtime.fp16.unfused_optimizer import FP16_UnfusedOptimizer
 from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
+from deepspeed.runtime.fp8_optimizer import FP8_Optimizer
 
 from deepspeed.runtime.config import DEEPSPEED_OPTIMIZERS, \
     ADAGRAD_OPTIMIZER, ADAM_OPTIMIZER, ADAMW_OPTIMIZER, LAMB_OPTIMIZER, ONEBIT_ADAM_OPTIMIZER, ONEBIT_LAMB_OPTIMIZER, \
@@ -222,6 +223,7 @@ class DeepSpeedEngine(Module):
         self.num_experts = []
         self.gate_modules = []
         self.moe_layers = []
+        self.has_sequence_parallel_params = False
         self._step_applied = False
         self._global_grad_norm = None
         self.use_ds_comm = False  # False --> Use torch.dist, True --> Use ds.comm backend.
@@ -239,6 +241,10 @@ class DeepSpeedEngine(Module):
         self._configure_with_arguments(args, mpu)
         self._do_sanity_check()
         see_memory_usage(f"DeepSpeed Engine: After args sanity test", force=self.memory_breakdown())
+
+        if self.fp16_enabled() and not get_accelerator().is_fp16_supported():
+            raise ValueError("Type fp16 is not supported.")
+
         if mpu is not None:
             if self.elasticity_enabled():
                 if not self.is_elastic_model_parallel_supported():
@@ -249,6 +255,7 @@ class DeepSpeedEngine(Module):
 
         dist.configure(self._config)
 
+        self.fp8_optimizer = self._config.fp8_optimizer_enabled
         self.monitor = MonitorMaster(self._config.monitor_config)
 
         see_memory_usage(
@@ -312,6 +319,14 @@ class DeepSpeedEngine(Module):
             self.optimizer = self._configure_zero_optimizer(optimizer=None)
         elif self.bfloat16_enabled():
             self.optimizer = self._configure_bf16_optimizer(optimizer=None)
+
+        #Sequence parallel related initialization
+        for param in self.module.parameters():
+            if getattr(param, 'sequence_parallel', False):
+                self.has_sequence_parallel_params = True
+                break
+        if self.has_sequence_parallel_params:
+            assert self.mpu is not None, "sequence parallel allreduce only supported with tensor parallel enabled"
 
         # Hook optimizer for snip_momentum pruning
         if hasattr(model, 'pruners'):
@@ -455,7 +470,10 @@ class DeepSpeedEngine(Module):
         Returns:
             float: norm
         """
-        return self._global_grad_norm
+        grad_norm = self._global_grad_norm
+        if isinstance(grad_norm, torch.Tensor):
+            grad_norm = grad_norm.item()
+        return grad_norm
 
     def __getattr__(self, name):
         """
@@ -977,13 +995,13 @@ class DeepSpeedEngine(Module):
         device_rank = args.device_rank if args is not None and hasattr(args, 'device_rank') else self.local_rank
         if device_rank >= 0:
             get_accelerator().set_device(device_rank)
-            self.device = torch.device(get_accelerator().device_name(), device_rank)
+            self.device = torch.device(get_accelerator().device_name(device_rank))
             self.world_size = dist.get_world_size()
             self.global_rank = dist.get_rank()
         else:
             self.world_size = 1
             self.global_rank = 0
-            self.device = torch.device(get_accelerator().device_name())
+            self.device = get_accelerator().device()
 
     # Configure based on command line arguments
     def _configure_with_arguments(self, args, mpu):
@@ -1254,6 +1272,8 @@ class DeepSpeedEngine(Module):
 
         if optimizer_wrapper == ZERO_OPTIMIZATION:
             self.optimizer = self._configure_zero_optimizer(basic_optimizer)
+        elif self.fp8_optimizer:
+            self.optimizer = self._configure_fp8_optimizer(basic_optimizer)
         elif optimizer_wrapper == AMP:
             amp_params = self.amp_params()
             log_dist(f"Initializing AMP with these params: {amp_params}", ranks=[0])
@@ -1268,7 +1288,7 @@ class DeepSpeedEngine(Module):
         else:
             self.optimizer = basic_optimizer
 
-        log_dist("DeepSpeed Final Optimizer = {}".format(self.optimizer_name()), ranks=[0])
+        log_dist("DeepSpeed Final Optimizer = {}".format(self.optimizer.__class__.__name__), ranks=[0])
 
         self.compression_scheduler = self._configure_compression_scheduler()
         self.quantizer = self._configure_quantization()
@@ -1478,7 +1498,29 @@ class DeepSpeedEngine(Module):
                                    timers=timers,
                                    grad_acc_dtype=self.get_data_types()[1],
                                    graph_harvesting=self.graph_harvesting(),
-                                   immediate_grad_update=self._config.bfloat16_immediate_grad_update)
+                                   immediate_grad_update=self._config.bfloat16_immediate_grad_update,
+                                   has_moe_layers=self.has_moe_layers)
+
+        return optimizer
+
+    def _configure_fp8_optimizer(self, optimizer):
+        clip_grad = self.gradient_clipping()
+
+        if optimizer is None:
+            optimizer = DummyOptim(list(self.module.parameters()))
+
+        log_dist('Creating FP8 optimizer', ranks=[0])
+
+        timers = self.timers if self.wall_clock_breakdown() else NoopTimer()
+        optimizer = FP8_Optimizer(optimizer,
+                                  self.param_names,
+                                  mpu=self.mpu,
+                                  clip_grad=clip_grad,
+                                  allgather_bucket_size=self.zero_allgather_bucket_size(),
+                                  dp_process_group=self.seq_data_parallel_group,
+                                  timers=timers,
+                                  grad_acc_dtype=self.get_data_types()[1],
+                                  immediate_grad_update=self._config.bfloat16_immediate_grad_update)
 
         return optimizer
 
@@ -1609,8 +1651,7 @@ class DeepSpeedEngine(Module):
                     communication_data_type=self.communication_data_type,
                     zero_hpz_partition_size=self.zero_hpz_partition_size(),
                     zero_quantized_weights=self.zero_quantized_weights(),
-                    zero_quantized_nontrainable_weights=self.zero_quantized_nontrainable_weights(),
-                )
+                    zero_quantized_nontrainable_weights=self.zero_quantized_nontrainable_weights())
 
         else:
             raise NotImplementedError("ZeRO stage {} not implemented".format(zero_stage))
@@ -1924,9 +1965,6 @@ class DeepSpeedEngine(Module):
                 self.optimizer.reduce_gradients(pipeline_parallel=self.pipeline_parallelism)
             else:
                 grads = None
-                if hasattr(self.optimizer, "get_grads_for_reduction"):
-                    # This is currently for BF16 optimizer
-                    grads = self.optimizer.get_grads_for_reduction()
                 self.buffered_allreduce_fallback(grads=grads, elements_per_buffer=bucket_size)
 
     @instrument_w_nvtx
@@ -1959,7 +1997,7 @@ class DeepSpeedEngine(Module):
                 if self.global_rank == 0:
                     self.summary_events = [(
                         f"Train/Samples/train_loss",
-                        self.losses.item(),
+                        self.losses.item() / self.gradient_accumulation_steps(),
                         self.global_samples,
                     )]
                     self.monitor.write_events(self.summary_events)
@@ -2335,7 +2373,7 @@ class DeepSpeedEngine(Module):
         mom = self.get_mom()
         log_dist(f"step={step}, skipped={self.skipped_steps}, lr={lr}, mom={mom}", ranks=[0])
 
-    def allreduce_bucket(self, bucket, dp_group):
+    def allreduce_bucket(self, bucket, dp_group, dp_world_size=None):
         tensor = self.flatten(bucket)
 
         tensor_to_allreduce = tensor
@@ -2343,16 +2381,18 @@ class DeepSpeedEngine(Module):
         if self.communication_data_type != tensor.dtype:
             tensor_to_allreduce = tensor.to(self.communication_data_type)
 
+        if dp_world_size is None:
+            dp_world_size = dist.get_world_size(group=dp_group)
         if self.postscale_gradients():
             if self.gradient_predivide_factor() != 1.0:
                 tensor_to_allreduce.mul_(1.0 / self.gradient_predivide_factor())
 
             dist.all_reduce(tensor_to_allreduce, group=dp_group)
             if self.gradient_average:
-                if self.gradient_predivide_factor() != dist.get_world_size(group=dp_group):
-                    tensor_to_allreduce.mul_(self.gradient_predivide_factor() / dist.get_world_size(group=dp_group))
+                if self.gradient_predivide_factor() != dp_world_size:
+                    tensor_to_allreduce.mul_(self.gradient_predivide_factor() / dp_world_size)
         else:
-            tensor_to_allreduce.mul_(1. / dist.get_world_size(group=dp_group))
+            tensor_to_allreduce.mul_(1. / dp_world_size)
             dist.all_reduce(tensor_to_allreduce, group=dp_group)
 
         if self.communication_data_type != tensor.dtype and tensor is not tensor_to_allreduce:
@@ -2360,23 +2400,23 @@ class DeepSpeedEngine(Module):
 
         return tensor
 
-    def allreduce_and_copy(self, small_bucket, dp_group):
-        allreduced = self.allreduce_bucket(small_bucket, dp_group)
+    def allreduce_and_copy(self, small_bucket, dp_group, dp_world_size=None):
+        allreduced = self.allreduce_bucket(small_bucket, dp_group, dp_world_size)
         for buf, synced in zip(small_bucket, self.unflatten(allreduced, small_bucket)):
             buf.copy_(synced)
 
-    def allreduce_no_retain(self, bucket, dp_group, numel_per_bucket=500000000):
+    def allreduce_no_retain(self, bucket, dp_group, numel_per_bucket=500000000, dp_world_size=None):
         small_bucket = []
         numel = 0
         for tensor in bucket:
             small_bucket.append(tensor)
             numel = numel + tensor.numel()
             if numel > numel_per_bucket:
-                self.allreduce_and_copy(small_bucket, dp_group)
+                self.allreduce_and_copy(small_bucket, dp_group, dp_world_size)
                 small_bucket = []
                 numel = 0
         if len(small_bucket) > 0:
-            self.allreduce_and_copy(small_bucket, dp_group)
+            self.allreduce_and_copy(small_bucket, dp_group, dp_world_size)
 
     def _get_gradients_for_reduction(self):
         non_expert_grads = []
@@ -2427,26 +2467,35 @@ class DeepSpeedEngine(Module):
                 self.allreduce_no_retain(dense_bucket, dp_group=dp_group, numel_per_bucket=elements_per_buffer)
 
     def _reduce_expert_gradients(self, expert_grads, elements_per_buffer):
+        # to maintain the gradients value unaffected by ep_size setting,
+        # utilize dp_world_size for allreduce average
+        dp_world_size = dist.get_world_size(groups._get_data_parallel_group())
         for ep_name, expert_grads_group in expert_grads.items():
+            ep_dp_group = groups._get_expert_data_parallel_group(ep_name)
             split_sparse_tensor_buckets, split_dense_tensor_buckets = split_half_float_double_sparse(
                 expert_grads_group)
 
             for _, sparse_bucket_tuple in enumerate(split_sparse_tensor_buckets):
                 if sparse_bucket_tuple:
                     bucket_type, sparse_bucket = sparse_bucket_tuple
-                    self.sparse_allreduce_no_retain(sparse_bucket, groups._get_expert_data_parallel_group(ep_name))
+                    self.sparse_allreduce_no_retain(sparse_bucket, dp_group=ep_dp_group, dp_world_size=dp_world_size)
 
             for _, dense_bucket_tuple in enumerate(split_dense_tensor_buckets):
                 if dense_bucket_tuple:
                     bucket_type, dense_bucket = dense_bucket_tuple
                     # Separate between diff groups
                     self.allreduce_no_retain(dense_bucket,
-                                             dp_group=groups._get_expert_data_parallel_group(ep_name),
-                                             numel_per_bucket=elements_per_buffer)
+                                             dp_group=ep_dp_group,
+                                             numel_per_bucket=elements_per_buffer,
+                                             dp_world_size=dp_world_size)
 
     def buffered_allreduce_fallback(self, grads=None, elements_per_buffer=500000000):
         if grads is None:
-            non_expert_grads, expert_grads = self._get_gradients_for_reduction()
+            if hasattr(self.optimizer, "get_grads_for_reduction"):
+                # This is currently for BF16 optimizer
+                non_expert_grads, expert_grads = self.optimizer.get_grads_for_reduction()
+            else:
+                non_expert_grads, expert_grads = self._get_gradients_for_reduction()
         else:
             assert not self.has_moe_layers, "attempting to reduce grads in unsupported way w.r.t. MoE"
             non_expert_grads = grads
@@ -2456,8 +2505,19 @@ class DeepSpeedEngine(Module):
         if self.has_moe_layers:
             self._reduce_expert_gradients(expert_grads, elements_per_buffer)
 
-    def sparse_allreduce_no_retain(self, bucket, dp_group):
-        allreduced_sparses = self.sparse_allreduce_bucket(bucket, dp_group)
+        if self.has_sequence_parallel_params:
+            for i, group in enumerate(self.optimizer.bf16_groups):
+                if group is None:
+                    dtypes = self.optimizer.optimizer.param_groups[i]['group_dtypes']
+                    group = self.optimizer.fp8_param_groups_dict[dtypes[0]]["param_groups"][i]
+                for j, lp in enumerate(group):
+                    if getattr(lp, 'sequence_parallel', False):
+                        dist.all_reduce(self.optimizer.fp32_groups_gradients[i][j],
+                                        op=dist.ReduceOp.SUM,
+                                        group=self.mpu.get_slice_parallel_group())
+
+    def sparse_allreduce_no_retain(self, bucket, dp_group, dp_world_size=None):
+        allreduced_sparses = self.sparse_allreduce_bucket(bucket, dp_group, dp_world_size)
         # Densify sparse tensor and copy back to original location
         for tensor in allreduced_sparses:
             if tensor.is_sparse:
@@ -2465,13 +2525,13 @@ class DeepSpeedEngine(Module):
             else:
                 tensor.orig_dense_tensor.copy_(tensor.to_dense())
 
-    def sparse_allreduce_bucket(self, bucket, dp_group):
+    def sparse_allreduce_bucket(self, bucket, dp_group, dp_world_size=None):
         sparse_list = []
         for sparse in bucket:
-            sparse_list.append(self.sparse_allreduce(sparse, dp_group))
+            sparse_list.append(self.sparse_allreduce(sparse, dp_group, dp_world_size))
         return sparse_list
 
-    def sparse_allreduce(self, sparse, dp_group):
+    def sparse_allreduce(self, sparse, dp_group, dp_world_size=None):
         original_data_type = sparse.values.dtype
         if self.communication_data_type != sparse.values.dtype:
             if self.communication_data_type in (torch.float16, torch.bfloat16):
@@ -2483,12 +2543,13 @@ class DeepSpeedEngine(Module):
             indices = sparse.indices
             values = sparse.values
 
+        if dp_world_size is None:
+            dp_world_size = dist.get_world_size(group=dp_group)
         if self.postscale_gradients():
             if self.gradient_average:
-                values.mul_(self.gradient_predivide_factor() /
-                            (dist.get_world_size(group=dp_group) / float(self.sequence_parallel_size)))
+                values.mul_(self.gradient_predivide_factor() / (dp_world_size / float(self.sequence_parallel_size)))
         else:
-            values.mul_(1. / (dist.get_world_size(group=dp_group) / float(self.sequence_parallel_size)))
+            values.mul_(1. / (dp_world_size / float(self.sequence_parallel_size)))
 
         indices_device_list = self.sparse_all_gather(indices, dp_group)
         values_device_list = self.sparse_all_gather(values, dp_group)
@@ -2759,7 +2820,7 @@ class DeepSpeedEngine(Module):
 
         load_zero_checkpoint = load_path is not None and (self.zero_optimization() or self.bfloat16_enabled())
         if load_zero_checkpoint:
-            if load_optimizer_states and not load_module_only:
+            if (load_optimizer_states and not load_module_only) or self.load_universal_checkpoint():
                 success = self._load_zero_checkpoint(load_dir, tag, load_optimizer_states=load_optimizer_states)
             else:
                 success = False
@@ -2784,8 +2845,6 @@ class DeepSpeedEngine(Module):
 
         if self.load_universal_checkpoint():
             self.optimizer.update_lp_params()
-            if load_zero_checkpoint:
-                self.update_optimizer_step(step=client_states['iteration'] + 1)
 
         return load_path, client_states
 
@@ -2821,7 +2880,6 @@ class DeepSpeedEngine(Module):
             self._curr_ckpt_path = os.path.join(load_dir, tag)
 
         if self.has_moe_layers:
-            # print(checkpoint.keys())
             old_moe_load = False
             if not isinstance(checkpoint['num_experts'], list):
                 old_moe_load = True
@@ -2962,24 +3020,6 @@ class DeepSpeedEngine(Module):
         else:
             logger.info(f"loading {len(zero_sd_list)} zero partition checkpoints for rank {self.global_rank}")
         return True
-
-    def update_optimizer_step(self, step):
-
-        def set_step(d):
-            if isinstance(d['step'], torch.Tensor):
-                d['step'] = torch.tensor(step, dtype=d['step'].dtype, device=d['step'].device)
-            else:
-                d['step'] = step
-
-        optimizer = self.optimizer
-        base_optimizer = optimizer.optimizer
-        state = base_optimizer.state
-        for group in optimizer.param_groups:
-            if 'step' in group:
-                set_step(group)
-            for p in group['params']:
-                if p in state and len(state[p]) > 0 and 'step' in state[p]:
-                    set_step(state[p])
 
     def _get_mp_rank_zero_checkpoint_names(self, load_dir, tag, mp_rank, dp_world_size, bf16_mode):
         zero_ckpt_names = []
@@ -3236,9 +3276,12 @@ class DeepSpeedEngine(Module):
 
         # Load flow uses below saved file for model parameters, RNG and more
         if groups._get_data_parallel_rank() == 0:
-            # get non-moe parameters
+            # Get non-moe parameters
+            # Classes DeepSpeedEngine and PipelineEngine have different behavior for method module_state_dict.
+            # DeepSpeedEngine returns the state dict, where PipelineEngine saves the state dict and returns None.
+            # We need to get the state dict, therefore, call to DeepSpeedEngine (base class for PipelineEngine)
             model_state_dict = self._get_non_moe_state_dict(
-                self.module_state_dict(exclude_frozen_parameters=exclude_frozen_parameters))
+                DeepSpeedEngine.module_state_dict(self, exclude_frozen_parameters=exclude_frozen_parameters))
 
             # TODO: update num experts info,.. in checkpoint
             state = {

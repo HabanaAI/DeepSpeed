@@ -23,6 +23,9 @@ typedef __half ds_half_precision_t;
 #include "acl/acl.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 typedef c10::Half ds_half_precision_t;
+#elif defined(__BFLOAT16__)
+#include <torch/torch.h>
+typedef at::BFloat16 ds_half_precision_t
 #else
 #include <cmath>
 typedef unsigned short ds_half_precision_t;
@@ -259,6 +262,7 @@ void Adam_Optimizer::Step_AVX(size_t* rounded_size,
             simd_store<span>(_exp_avg + i, momentum_4, false);
             simd_store<span>(_exp_avg_sq + i, variance_4, false);
         }
+// Params are updated only in case of float16, which is currently not supported on HPU
 #if defined(__ENABLE_CUDA__)
         if (dev_params) {
             if (half_precision)

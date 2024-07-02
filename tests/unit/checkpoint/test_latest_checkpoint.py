@@ -11,6 +11,7 @@ from unit.simple_model import *
 
 from unit.checkpoint.common import checkpoint_correctness_verification
 from deepspeed.ops.op_builder import FusedAdamBuilder
+from deepspeed.accelerator import get_accelerator
 
 if not deepspeed.ops.__compatible_ops__[FusedAdamBuilder.NAME]:
     pytest.skip("This op had not been implemented on this system.", allow_module_level=True)
@@ -19,7 +20,8 @@ if not deepspeed.ops.__compatible_ops__[FusedAdamBuilder.NAME]:
 class TestLatestCheckpoint(DistributedTest):
     world_size = 1
 
-    def test_existing_latest(self, tmpdir):
+    @pytest.mark.parametrize('compile_mode', [True, False])
+    def test_existing_latest(self, tmpdir, compile_mode):
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -28,6 +30,10 @@ class TestLatestCheckpoint(DistributedTest):
                 "params": {
                     "lr": 0.00015
                 }
+            },
+            "compile": {
+                "enabled": compile_mode,
+                "backend": get_accelerator().get_compile_backend()
             }
         }
         hidden_dim = 10
@@ -41,7 +47,8 @@ class TestLatestCheckpoint(DistributedTest):
                                             fp16=False,
                                             empty_tag=True)
 
-    def test_missing_latest(self, tmpdir):
+    @pytest.mark.parametrize('compile_mode', [True, False])
+    def test_missing_latest(self, tmpdir, compile_mode):
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -50,6 +57,10 @@ class TestLatestCheckpoint(DistributedTest):
                 "params": {
                     "lr": 0.00015
                 }
+            },
+            "compile": {
+                "enabled": compile_mode,
+                "backend": get_accelerator().get_compile_backend()
             }
         }
         hidden_dim = 10

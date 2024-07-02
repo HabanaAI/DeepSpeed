@@ -25,8 +25,9 @@ from torch import _C
 
 from deepspeed.runtime.config import DeepSpeedConfig
 from deepspeed.utils import logger
-from deepspeed.runtime.utils import copy_to_device, move_to_device, see_memory_usage, bwc_tensor_model_parallel_rank
+from deepspeed.runtime.utils import copy_to_device, move_to_device, see_memory_usage
 from deepspeed.utils.timer import SynchronizedWallClockTimer as Timers, FORWARD_GLOBAL_TIMER
+from deepspeed.utils.bwc import bwc_tensor_model_parallel_rank
 from deepspeed.accelerator import get_accelerator
 
 # DeepSpeed Checkpointing Enabled or Disabled
@@ -605,6 +606,9 @@ class CheckpointFunction(torch.autograd.Function):
         # removing pointers to the contiguous buffer memory
         # so that they can be garbage collected once the checkpoints
         # have been used
+        if grads[0].device.type == 'hpu':
+            import habana_frameworks.torch as htorch
+            htorch.core.mark_step()
         if SYNCHRONIZE:
             get_accelerator().synchronize()
         if PROFILE_TIME:

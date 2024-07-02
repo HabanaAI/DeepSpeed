@@ -12,7 +12,9 @@ from unit.common import DistributedTest
 from unit.simple_model import SimpleModel, SimpleOptimizer, random_dataloader, SimpleMoEModel, sequence_dataloader
 from deepspeed.runtime.utils import required_torch_version
 from deepspeed.accelerator import get_accelerator
-from deepspeed.ops.op_builder import CPUAdamBuilder
+from deepspeed.ops.op_builder import CPUAdamBuilder, FusedLambBuilder, FusedAdamBuilder
+from unit.util import hpu_lazy_enabled
+from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer
 
 try:
     from apex import amp  # noqa: F401 # type: ignore
@@ -21,7 +23,11 @@ except ImportError:
     _amp_available = False
 amp_available = pytest.mark.skipif(not _amp_available, reason="apex/amp is not installed")
 
+if torch.half not in get_accelerator().supported_dtypes():
+    pytest.skip(f"fp16 not supported, valid dtype: {get_accelerator().supported_dtypes()}", allow_module_level=True)
 
+
+@pytest.mark.skipif(not deepspeed.ops.__compatible_ops__[FusedLambBuilder.NAME], reason="lamb is not compatible")
 class TestLambFP32GradClip(DistributedTest):
     world_size = 2
 
@@ -52,6 +58,7 @@ class TestLambFP32GradClip(DistributedTest):
             model.step()
 
 
+@pytest.mark.skipif(not deepspeed.ops.__compatible_ops__[FusedLambBuilder.NAME], reason="lamb is not compatible")
 class TestLambFP16(DistributedTest):
     world_size = 2
 
@@ -187,6 +194,8 @@ class TestFP16OptimizerForMoE(DistributedTest):
             engine.backward(loss)
             engine.step()
 
+    @pytest.mark.skipif(not deepspeed.ops.__compatible_ops__[FusedAdamBuilder.NAME],
+                        reason="fused adam is not compatible")
     def test_fused_gradnorm(self, monkeypatch):
         if not required_torch_version(min_version=1.8):
             pytest.skip("DeepSpeed MoE tests need torch 1.8 or higher to run correctly")
@@ -203,8 +212,10 @@ class TestFP16OptimizerForMoE(DistributedTest):
 
         # initialize MoE
         model = SimpleMoEModel(hidden_dim, ep_size=2)
+        param_group = {'params': [p for p in model.parameters()], 'name': 'random-unique-name'}
+        params = split_params_into_different_moe_groups_for_optimizer(param_group)
         # optimizer = torch.optim.AdamW(params=model.parameters())
-        optimizer = FusedAdam(params=model.parameters())
+        optimizer = FusedAdam(params=params)
         engine, optimizer, _, _ = deepspeed.initialize(config=config_dict,
                                                        model=model,
                                                        optimizer=optimizer,
@@ -216,6 +227,7 @@ class TestFP16OptimizerForMoE(DistributedTest):
             engine.backward(loss)
             engine.step()
 
+    @pytest.mark.skipif(not deepspeed.ops.__compatible_ops__[FusedLambBuilder.NAME], reason="lamb is not compatible")
     @pytest.mark.parametrize("fused_lamb_legacy", [(False), (True)])
     def test_lamb_gradnorm(self, monkeypatch, fused_lamb_legacy: bool):
         if not required_torch_version(min_version=1.8):
@@ -561,8 +573,10 @@ class TestZeroSupportedClientOptimizer(DistributedTest):
             }
         }
         hidden_dim = 10
-
         model = SimpleModel(hidden_dim)
+        if hpu_lazy_enabled():
+            device = get_accelerator().device_name()
+            model.to(device)
         client_optimizer = optimizer_constructor(params=model.parameters())
         model, _, _, _ = deepspeed.initialize(config=config_dict, model=model, optimizer=client_optimizer)
 
@@ -690,6 +704,9 @@ class TestZeroEmptyGrad(DistributedTest):
         hidden_dim = 10
 
         model = SimpleModel(hidden_dim)
+        if hpu_lazy_enabled():
+            device = get_accelerator().device_name()
+            model.to(device)
         optimizer = torch.optim.Adam(model.parameters())
         model, _, _, _ = deepspeed.initialize(config=config_dict, model=model, optimizer=optimizer)
         data_loader = random_dataloader(model=model, total_samples=50, hidden_dim=hidden_dim, device=model.device)

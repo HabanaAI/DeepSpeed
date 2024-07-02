@@ -6,7 +6,6 @@
 import copy
 import torch.nn as nn
 import pytest
-
 import deepspeed.comm as dist
 from deepspeed.runtime.pipe.topology import PipeDataParallelTopology
 from deepspeed.runtime.pipe.module import PipelineModule
@@ -67,7 +66,6 @@ class TestPipeCifar10(DistributedTest):
         skip_on_arch(min_arch=7)
         topo = PipeTopo(**topo_config)
         steps = 100  # must be >=100
-
         # Allocate model for consistent initial weights.
         init_net = AlexNetPipe()
 

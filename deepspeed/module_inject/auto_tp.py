@@ -133,7 +133,7 @@ class Loading():
         load_layers = [nn.Linear, nn.Embedding, nn.LayerNorm]
         load_layer_names = [
             "LPLayerNorm", "SharedEmbedding", "OPTLearnedPositionalEmbedding", "LlamaRMSNorm", "FalconLinear",
-            "MistralRMSNorm", "T5LayerNorm"
+            "MistralRMSNorm", "T5LayerNorm", "MixtralRMSNorm"
         ]
         return module.__class__ in load_layers or module._get_name() in load_layer_names
 
@@ -302,6 +302,9 @@ class AutoTP():
                     gem_list = gem_list + [layer]
                 elif 'self_attention.dense' in layer and 'falcon' in str(
                         type(module)):  # this is a hack to get the right linear layer for this model!
+                    gem_list = gem_list + [layer]
+                # Mixtral-7x8b used w2*act(w1*w3) linear. need to replace w2 to linearallreduce.
+                elif 'w2' in layer and 'mixtral' in str(type(module)):
                     gem_list = gem_list + [layer]
 
             layer_list = []

@@ -50,6 +50,13 @@ try:
 except ImportError:
     pass
 
+# Add hpex FusedAdamW to supported list if hpex is installed
+try:
+    from habana_frameworks.torch.hpex.optimizers import FusedAdamW
+    ZERO_SUPPORTED_OPTIMIZERS.append(FusedAdamW)
+except ImportError:
+    pass
+
 
 def is_zero_supported_optimizer(optimizer):
     if dist.get_rank() == 0:
@@ -65,7 +72,6 @@ def get_lst_from_rank0(lst: List[int]) -> None:
     lst_tensor = torch.tensor(
         lst if dist.get_rank() == 0 else [-1] * len(lst),
         dtype=int,
-        # device=get_accelerator().current_device_name(),
         device=torch.device(get_accelerator().device_name(os.environ["LOCAL_RANK"])),
         requires_grad=False,
     )

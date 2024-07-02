@@ -11,11 +11,11 @@ from deepspeed import comm as dist
 from deepspeed.utils import groups
 
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-from deepspeed.runtime import ZeROOptimizer
+from deepspeed.runtime.base_optimizer import ZeROOptimizer
 from deepspeed.utils import logger
 from deepspeed.runtime.fp16.loss_scaler import CreateLossScaler
 from deepspeed.runtime.comm.coalesced_collectives import reduce_scatter_coalesced, all_to_all_quant_reduce
-from deepspeed.runtime.utils import inf, get_global_norm, is_model_parallel_parameter, get_only_unique_item
+from deepspeed.runtime.utils import inf, is_model_parallel_parameter, get_only_unique_item
 from deepspeed.runtime.zero.partition_parameters import *
 from deepspeed.runtime.zero.config import ZeroStageEnum
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
@@ -215,14 +215,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.module = module
         self.elastic_checkpoint = elastic_checkpoint
 
-        self.inf_or_nan_tracker: Tensor = torch.zeros(1,
-                                                      dtype=torch.bool,
-                                                      device=get_accelerator().current_device_name(),
-                                                      requires_grad=False)
+        self.device = get_accelerator().current_device_name() if not self.offload_optimizer else OffloadDeviceEnum.cpu
+
+        self.inf_or_nan_tracker: Tensor = torch.zeros(1, dtype=torch.bool, device=self.device, requires_grad=False)
 
         self.deepspeed_adam_offload = (self.offload_optimizer and type(init_optimizer) == DeepSpeedCPUAdam)
 
-        self.device = get_accelerator().current_device_name() if not self.offload_optimizer else OffloadDeviceEnum.cpu
         ### streams used for overlapping computation with communication
         self.reduce_and_partition_stream = None if get_accelerator().is_synchronized_device() else get_accelerator(
         ).Stream() if overlap_comm else get_accelerator().default_stream()
@@ -326,7 +324,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         self.param_reduce_events: Deque[get_accelerator().Event] = collections.deque()
         # TODO. make this configurable via JSON
-        self.max_param_reduce_events: int = 2
+        self.max_param_reduce_events: int = 2 if get_accelerator().device_name() != "hpu" else -1
 
         self.param_dict = {}
 
@@ -468,16 +466,13 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     param.ds_secondary_tensor = None
 
     def _setup_for_real_optimizer(self):
-        see_memory_usage("Before creating fp32 partitions", force=True)
         self._create_fp32_partitions()
-        see_memory_usage("After creating fp32 partitions", force=True)
         dist.barrier()
 
         # To support pipelined optimizer swapping
         self._create_next_swappable_fp32_groups()
 
         see_memory_usage("Before initializing optimizer states", force=True)
-
         self.initialize_optimizer_states()
         see_memory_usage("After initializing optimizer states", force=True)
         dist.barrier()
@@ -548,6 +543,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             offset += tensor_numel
 
         gc.collect()
+        #TODO SW-107191: support empty_cache() in hpu
         get_accelerator().empty_cache()
 
         # copy tensors (now flattened and contiguous) back to GPU
@@ -1259,7 +1255,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         while self.param_reduce_events and self.param_reduce_events[0].query():
             self.param_reduce_events.popleft()
-        if len(self.param_reduce_events) > self.max_param_reduce_events:
+        if len(self.param_reduce_events) > self.max_param_reduce_events > -1:
             self.param_reduce_events.popleft().synchronize()
 
         with get_accelerator().stream(self.reduce_and_partition_stream):
@@ -1412,7 +1408,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         err = torch.tensor(-1.0, device=self.device, dtype=torch.float)
         total_norm = inf_or_nan * err + inf_or_nan.logical_not() * total_norm
 
-        return total_norm
+        return total_norm.cpu()
 
     @instrument_w_nvtx
     def partition_grads(self, params_to_release: List[Parameter], grad_partitions: List[Tensor]) -> None:
@@ -1988,7 +1984,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if self.swap_optimizer:
             self.optimizer_swapper.log_timers()
 
-        self.invalidate_secondary_tensor()
+        # self.invalidate_secondary_tensor() # given that we want hpz in forward pass when no_grad is set, we need to keep the secondary tensor
 
         self.timers.log(timer_names)
 
@@ -2027,7 +2023,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             return
 
         norm_groups = self._get_norm_groups()
-        scaled_global_grad_norm = get_global_norm(norm_list=norm_groups)
+        scaled_global_grad_norm = torch.norm(torch.stack(norm_groups))
 
         # Stash unscaled gradient norm
         self._global_grad_norm = scaled_global_grad_norm / self.loss_scale
@@ -2147,7 +2143,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     self.inf_or_nan_tracker += torch.isnan(self.grad_partitions_flat_buffer).any()
                     self.inf_or_nan_tracker = self.inf_or_nan_tracker > 0
 
-                overflow_gpu = self.inf_or_nan_tracker.clone().to(torch.uint8)
+                overflow_gpu = self.inf_or_nan_tracker.clone().to(get_accelerator().current_device_name()).to(
+                    torch.uint8)
                 self.inf_or_nan_tracker.zero_()
 
             if not get_accelerator().resolves_data_dependency():

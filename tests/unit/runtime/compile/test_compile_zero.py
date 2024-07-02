@@ -8,6 +8,7 @@ import torch
 
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
 from deepspeed.runtime.utils import required_torch_version
+from deepspeed.accelerator import get_accelerator
 
 from unit.runtime.compile.util import compare_loss
 from unit.common import DistributedTest
@@ -48,7 +49,7 @@ class TestZeRO(DistributedTest):
             },
             "compile": {
                 "enabled": True,
-                "backend": "inductor"
+                "backend": get_accelerator().get_compile_backend()
             }
         }
 

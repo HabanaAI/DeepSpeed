@@ -18,7 +18,6 @@ class TestNestingInit(DistributedTest):
 
     def test_nesting_init(self):
         ds_config = dict(train_batch_size=1, zero_optimization=dict(stage=3))
-
         with deepspeed.zero.Init(config_dict_or_path=ds_config):
             with deepspeed.zero.Init(config_dict_or_path=ds_config):
                 model = torch.nn.Linear(4, 4)

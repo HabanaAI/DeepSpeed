@@ -31,7 +31,10 @@ from ..autotuning import Autotuner
 from deepspeed.accelerator import get_accelerator
 
 DLTS_HOSTFILE = "/job/hostfile"
-EXPORT_ENVS = ['MLFLOW', 'PYTHON', 'MV2', 'UCX']
+EXPORT_ENVS = [
+    'MLFLOW', 'NCCL', 'PYTHON', 'MV2', 'UCX', 'PT_HPU_ENABLE_REFINE_DYNAMIC_SHAPES', 'PT_HPU_LAZY_ACC_PAR_MODE',
+    'PT_HPU_ENABLE_WEIGHT_CPU_PERMUTE'
+]
 EXPORT_ENVS += NEBULA_EXPORT_ENVS
 DEEPSPEED_ENVIRONMENT_NAME = os.getenv("DS_ENV_FILE", ".deepspeed_env")
 DEEPSPEED_ENVIRONMENT_PATHS = [os.path.expanduser("~"), '.']
@@ -482,6 +485,18 @@ def main(args=None):
 
     if args.elastic_training:
         assert not args.no_local_rank, "--no_local_rank argument is not supported in Elastic training"
+
+    if get_accelerator().device_name() == 'hpu':
+        # TODO: SW-113485 need to remove the below WA once SW-113485 is unblocked
+        def update_wa_env_var(key, value):
+            if key not in os.environ.keys():
+                env[key] = value
+
+        update_wa_env_var("PT_HPU_LAZY_ACC_PAR_MODE", "0")
+        # todo SW-125782: remove DYNAMIC SHAPE disable WA
+        update_wa_env_var("PT_HPU_ENABLE_REFINE_DYNAMIC_SHAPES", "0")
+        # todo SW-145489: remove WEIGHT CPU PERMUTE WA after SW-145491 is resolved
+        update_wa_env_var("PT_HPU_ENABLE_WEIGHT_CPU_PERMUTE", "0")
 
     # encode world info as base64 to make it easier to pass via command line
     world_info_base64 = encode_world_info(active_resources)

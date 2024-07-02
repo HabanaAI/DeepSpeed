@@ -31,7 +31,7 @@ def base_config():
         },
         "compile": {
             "enabled": True,
-            "backend": "inductor"
+            "backend": get_accelerator().get_compile_backend()
         }
     }
     return config_dict

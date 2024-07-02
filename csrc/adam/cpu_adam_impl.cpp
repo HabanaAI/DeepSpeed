@@ -244,13 +244,17 @@ int ds_adam_step(int optimizer_id,
     opt->IncrementStep(step, beta1, beta2);
     opt->update_state(lr, epsilon, weight_decay, bias_correction);
 
+    bool bit16_precision = false;
+    if ((params.options().dtype() == at::kHalf) || (params.options().dtype() == at::kBFloat16))
+        bit16_precision = true;
+
     opt->Step_8(params_ptr,
                 grads_ptr,
                 exp_avg_ptr,
                 exp_avg_sq_ptr,
                 params_c.numel(),
                 nullptr,
-                (params.options().dtype() == at::kHalf));
+                bit16_precision);
 
 #if defined(__ENABLE_CUDA__) or defined(__ENABLE_CANN__)
     opt->SynchronizeStreams();

@@ -21,9 +21,10 @@ import deepspeed.comm as dist
 import pytest
 from _pytest.outcomes import Skipped
 from _pytest.fixtures import FixtureLookupError, FixtureFunctionMarker
+from unit.util import hpu_lazy_enabled
 
 # Worker timeout for tests that hang
-DEEPSPEED_TEST_TIMEOUT = 600
+DEEPSPEED_TEST_TIMEOUT = int(os.environ.get('DEEPSPEED_TEST_TIMEOUT', '600'))
 
 
 def is_rocm_pytorch():
@@ -59,6 +60,7 @@ def get_master_port(base_port=29500, port_range_size=1000):
 
 
 def set_accelerator_visible():
+    # below function relevant for GPU
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", None)
     xdist_worker_id = get_xdist_worker_id()
     if xdist_worker_id is None:
@@ -84,13 +86,25 @@ def set_accelerator_visible():
         elif get_accelerator().device_name() == 'npu':
             npu_smi = subprocess.check_output(['npu-smi', 'info', '-l'])
             num_accelerators = int(npu_smi.decode('utf-8').strip().split('\n')[0].split(':')[1].strip())
+        elif get_accelerator().device_name() == 'hpu':
+            try:
+                hl_smi = subprocess.check_output(['hl-smi', "-L"])
+                num_accelerators = re.findall(r"Module ID\s+:\s+(\d+)", hl_smi.decode())
+            except FileNotFoundError:
+                sim_list = subprocess.check_output(['ls', '-1', '/dev/accel'])
+                num_accelerators = re.findall(r"accel(\d+)", sim_list.decode())
+            num_accelerators = sorted(num_accelerators, key=int)
+            os.environ["HABANA_VISIBLE_MODULES"] = ",".join(num_accelerators)
         else:
             assert get_accelerator().device_name() == 'cpu'
             cpu_sockets = int(
                 subprocess.check_output('cat /proc/cpuinfo | grep "physical id" | sort -u | wc -l', shell=True))
             num_accelerators = cpu_sockets
 
-        cuda_visible = ",".join(map(str, range(num_accelerators)))
+        if isinstance(num_accelerators, list):
+            cuda_visible = ",".join(num_accelerators)
+        else:
+            cuda_visible = ",".join(map(str, range(num_accelerators)))
 
     # rotate list based on xdist worker id, example below
     # wid=0 -> ['0', '1', '2', '3']
@@ -114,6 +128,9 @@ class DistributedExec(ABC):
     requires_cuda_env = True
     reuse_dist_env = False
     non_daemonic_procs = False
+    #WA to SW-181871, until it is not fixed set non_daemonic_procs to True for eager mode.
+    if get_accelerator().device_name() == 'hpu':
+        non_daemonic_procs = not hpu_lazy_enabled()
     _pool_cache = {}
     exec_timeout = DEEPSPEED_TEST_TIMEOUT
 
@@ -147,6 +164,10 @@ class DistributedExec(ABC):
         return fixture_kwargs
 
     def _launch_daemonic_procs(self, num_procs):
+        if get_accelerator().device_name() == 'hpu':
+            if self.reuse_dist_env:
+                print("Ignoring reuse_dist_env for hpu")
+                self.reuse_dist_env = False
         # Create process pool or use cached one
         master_port = None
         if self.reuse_dist_env:
@@ -170,8 +191,9 @@ class DistributedExec(ABC):
             # hang (causing super long unit test runtimes)
             pytest.exit("Test hanged, exiting", returncode=1)
 
-        # Tear down distributed environment and close process pools
-        self._close_pool(pool, num_procs)
+        finally:
+            # Tear down distributed environment and close process pools
+            self._close_pool(pool, num_procs)
 
         # If we skipped a test, propagate that to this process
         if any(skip_msgs):
@@ -179,6 +201,12 @@ class DistributedExec(ABC):
             pytest.skip(skip_msgs[0])
 
     def _launch_non_daemonic_procs(self, num_procs):
+        #WA to SW-181871
+        if get_accelerator().device_name() == 'hpu':
+            if self.reuse_dist_env:
+                print("Ignoring reuse_dist_env for hpu")
+                self.reuse_dist_env = False
+
         assert not self.reuse_dist_env, "Cannot reuse distributed environment with non-daemonic processes"
 
         master_port = get_master_port()
@@ -284,6 +312,7 @@ class DistributedExec(ABC):
     def _dist_destroy(self):
         if (dist is not None) and dist.is_initialized():
             dist.barrier()
+            # tear down after test completes
             dist.destroy_process_group()
 
     def _close_pool(self, pool, num_procs, force=False):

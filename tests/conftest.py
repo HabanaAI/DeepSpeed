@@ -11,6 +11,13 @@ import os
 from os.path import abspath, dirname, join
 import torch
 import warnings
+from unit.ci_promote_marker import *
+from unit.xfail_marker import *
+from unit.skip_marker import *
+from unit.compile_marker import *
+from unit.util import get_hpu_dev_version
+from deepspeed.accelerator import get_accelerator
+from unit.util import hpu_lazy_enabled
 
 # Set this environment variable for the T5 inference unittest(s) (e.g. google/t5-v1_1-small)
 os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
@@ -70,6 +77,74 @@ def pytest_runtest_call(item):
         item.runtest = lambda: True  # Dummy function so test is not run twice
 
 
+def pytest_collection_modifyitems(items, config):
+    device = get_accelerator().device_name()
+    gaudi_dev = get_hpu_dev_version()
+    hpu_lazy_mode = hpu_lazy_enabled()
+    # Add comipile, CI and Promote marker
+    for item in items:
+        if device == 'hpu':
+            if item._nodeid in compile_tests:
+                item._pyfuncitem.add_marker(pytest.mark.compile)
+        if item._nodeid in hpu_ci_tests:
+            item._pyfuncitem.add_marker(pytest.mark.hpu_ci)
+        if item._nodeid in hpu_ci_tests_4cards:
+            item._pyfuncitem.add_marker(pytest.mark.hpu_ci_4cards)
+        if item._nodeid in gpu_ci_tests:
+            item._pyfuncitem.add_marker(pytest.mark.gpu_ci)
+        if item._nodeid in hpu_promote_tests:
+            item._pyfuncitem.add_marker(pytest.mark.hpu_promote)
+        if item._nodeid in hpu_promote_tests_4cards:
+            item._pyfuncitem.add_marker(pytest.mark.hpu_promote_4cards)
+        if item._nodeid in gpu_promote_tests:
+            item._pyfuncitem.add_marker(pytest.mark.gpu_promote)
+
+        # Add xfail and SKIP marker
+        item.user_properties.append(("module_name", item.module.__name__))
+        if device == 'hpu':
+            # Lazy Run
+            if hpu_lazy_mode:
+                if item._nodeid in hpu_lazy_xfail_tests.keys():
+                    item._pyfuncitem.add_marker(pytest.mark.xfail(reason=hpu_lazy_xfail_tests[item._nodeid]))
+                if item._nodeid in hpu_lazy_skip_tests.keys():
+                    item._pyfuncitem.add_marker(pytest.mark.skipif(reason=hpu_lazy_skip_tests[item._nodeid]))
+                if gaudi_dev == "Gaudi":
+                    if item._nodeid in g1_lazy_xfail_tests.keys():
+                        item._pyfuncitem.add_marker(pytest.mark.xfail(reason=g1_lazy_xfail_tests[item._nodeid]))
+                    if item._nodeid in g1_lazy_skip_tests.keys():
+                        item._pyfuncitem.add_marker(pytest.mark.skip(reason=g1_lazy_skip_tests[item._nodeid]))
+                if gaudi_dev == "Gaudi2":
+                    if item._nodeid in g2_lazy_xfail_tests.keys():
+                        item._pyfuncitem.add_marker(pytest.mark.xfail(reason=g2_lazy_xfail_tests[item._nodeid]))
+                    if item._nodeid in g2_lazy_skip_tests.keys():
+                        item._pyfuncitem.add_marker(pytest.mark.skip(reason=g2_lazy_skip_tests[item._nodeid]))
+            # Eager Run
+            else:
+                if item._nodeid in hpu_eager_xfail_tests.keys():
+                    item._pyfuncitem.add_marker(pytest.mark.xfail(reason=hpu_eager_xfail_tests[item._nodeid]))
+                if item._nodeid in hpu_eager_skip_tests.keys():
+                    item._pyfuncitem.add_marker(pytest.mark.skipif(reason=hpu_eager_skip_tests[item._nodeid]))
+                if gaudi_dev == "Gaudi":
+                    if item._nodeid in g1_eager_xfail_tests.keys():
+                        item._pyfuncitem.add_marker(pytest.mark.xfail(reason=g1_eager_xfail_tests[item._nodeid]))
+                    if item._nodeid in g1_eager_skip_tests.keys():
+                        item._pyfuncitem.add_marker(pytest.mark.skip(reason=g1_eager_skip_tests[item._nodeid]))
+                if gaudi_dev == "Gaudi2":
+                    if item._nodeid in g2_eager_xfail_tests.keys():
+                        item._pyfuncitem.add_marker(pytest.mark.xfail(reason=g2_eager_xfail_tests[item._nodeid]))
+                    if item._nodeid in g2_eager_skip_tests.keys():
+                        item._pyfuncitem.add_marker(pytest.mark.skip(reason=g2_eager_skip_tests[item._nodeid]))
+        else:
+            if item._nodeid in gpu_xfail_tests.keys():
+                item._pyfuncitem.add_marker(pytest.mark.xfail(reason=gpu_xfail_tests[item._nodeid]))
+            if item._nodeid in gpu_skip_tests.keys():
+                item._pyfuncitem.add_marker(pytest.mark.skipif(reason=gpu_skip_tests[item._nodeid]))
+        for marker in item.own_markers:
+            if marker.name in ['skip', 'xfail']:
+                if 'reason' in marker.kwargs:
+                    item.user_properties.append(("message", marker.kwargs['reason']))
+
+
 # We allow DistributedTest to reuse distributed environments. When the last
 # test for a class is run, we want to make sure those distributed environments
 # are destroyed.
@@ -85,3 +160,11 @@ def pytest_fixture_setup(fixturedef, request):
     if getattr(fixturedef.func, "is_dist_fixture", False):
         dist_fixture_class = fixturedef.func()
         dist_fixture_class(request)
+
+
+def pytest_runtest_makereport(item, call):
+    if call.when == 'call':
+        if call.excinfo:
+            if not (any('message' in prop for prop in item.user_properties)):
+                if call.excinfo.value:
+                    item.user_properties.append(("message", call.excinfo.value))

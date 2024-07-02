@@ -17,6 +17,7 @@ import torch
 import gc
 from deepspeed.accelerator import get_accelerator
 import re
+from os import getenv
 
 
 def load_model_with_checkpoint(r_module,
@@ -28,6 +29,8 @@ def load_model_with_checkpoint(r_module,
                                rank=0,
                                container=None):
     error_msgs = []
+    # TODO SW-170491: remove the below WA once SW-170491 is resolved.
+    llama_large_seq_perf_workaround = getenv("DEEPSPEED_LLAMA_LARGE_SEQ_PERF_WORKAROUND", "0").lower() in ["1", "true"]
 
     def prefix_check():
         # if keys start with 'model.' or 'transformer.', don't skip level 0 prefix
@@ -40,7 +43,11 @@ def load_model_with_checkpoint(r_module,
                 return False
         return True
 
-    skip_level_0_prefix = prefix_check() and container.policy.use_load_prefix
+    # TODO SW-170491: remove the below WA once SW-170491 is resolved.
+    if llama_large_seq_perf_workaround and container is None:
+        skip_level_0_prefix = prefix_check()
+    else:
+        skip_level_0_prefix = prefix_check() and container.policy.use_load_prefix
 
     def transpose(data):
         with torch.no_grad():
@@ -224,6 +231,11 @@ def load_model_with_checkpoint(r_module,
         RMSNorm: load
     }
 
+    # TODO SW-170491: remove the below WA once SW-170491 is resolved.
+    if llama_large_seq_perf_workaround:
+        print(f"Removed RMSNorm from layer_policies")
+        del layer_policies[RMSNorm]
+
     all_ds_ids = {}
 
     def load_module_recursive(module, prefix='', level=0):
@@ -248,16 +260,25 @@ def load_model_with_checkpoint(r_module,
                     if child.__class__ is nn.LayerNorm:
                         child = Normalize(dim=ds_shape[-1], dtype=child.weight.dtype, eps=child.eps)
                         setattr(module, name, child)
-                    elif child.__class__ in [nn.Linear, ColumnParallelLinear, RowParallelLinear]:
+                    elif (not llama_large_seq_perf_workaround
+                          and child.__class__ in [nn.Linear, ColumnParallelLinear, RowParallelLinear]):
+                        child = LinearLayer(weight_shape=child.weight.shape, bias=child.bias)
+                        setattr(module, name, child)
+                    # TODO SW-170491: remove the below WA once SW-170491 is resolved.
+                    elif llama_large_seq_perf_workaround and child.__class__ is nn.Linear:
                         child = LinearLayer(weight_shape=child.weight.shape, dtype=child.weight.dtype, bias=child.bias)
                         setattr(module, name, child)
                     elif child.__class__ is OPTLearnedPositionalEmbedding:
                         child = OPTEmbedding(weight_shape=ds_shape)
                         setattr(module, name, child)
-                    elif child.__class__ in [LlamaRMSNorm, RMSNorm]:
+                    elif not llama_large_seq_perf_workaround and child.__class__ in [LlamaRMSNorm, RMSNorm]:
                         child = RMSNormalize(dim=ds_shape[-1],
                                              dtype=child.weight.dtype,
                                              eps=child.eps if hasattr(child, 'eps') else child.variance_epsilon)
+                        setattr(module, name, child)
+                    # TODO SW-170491: remove the below WA once SW-170491 is resolved.
+                    elif llama_large_seq_perf_workaround and child.__class__ is LlamaRMSNorm:
+                        child = RMSNormalize(dim=ds_shape[-1], dtype=child.weight.dtype, eps=child.variance_epsilon)
                         setattr(module, name, child)
                     else:
                         ds_id = None

@@ -8,8 +8,9 @@ from deepspeed.runtime.utils import required_torch_version
 
 from unit.common import DistributedTest
 from unit.simple_model import *
-
+from deepspeed.accelerator import get_accelerator
 from unit.checkpoint.common import checkpoint_correctness_verification
+from unit.util import hpu_lazy_enabled
 
 import pytest
 
@@ -24,7 +25,7 @@ class TestMoECheckpoint(DistributedTest):
 
         config_dict = {"train_batch_size": 8, "steps_per_print": 1, "fp16": {"enabled": True}}
         hidden_dim = 16
-
+        fp16 = config_dict["fp16"]["enabled"]
         models = [SimpleMoEModel(hidden_dim=hidden_dim, num_experts=ep_size, ep_size=ep_size) for _ in range(2)]
         optimizers = [torch.optim.AdamW(params=model.parameters()) for model in models]
         checkpoint_correctness_verification(config_dict,
@@ -33,13 +34,14 @@ class TestMoECheckpoint(DistributedTest):
                                             tmpdir=tmpdir,
                                             load_optimizer_states=True,
                                             load_lr_scheduler_states=False,
-                                            fp16=config_dict["fp16"]["enabled"],
+                                            fp16=fp16,
                                             empty_tag=True,
                                             base_optimizers=optimizers,
                                             seq_dataloader=True)
 
+    @pytest.mark.parametrize('compile_mode', [True, False])
     @pytest.mark.parametrize("ep_size, load_optim_states", [(4, True), (4, False), (2, True), (2, False)])
-    def test_checkpoint_moe_and_zero(self, tmpdir, ep_size, load_optim_states):
+    def test_checkpoint_moe_and_zero(self, tmpdir, ep_size, load_optim_states, compile_mode):
         if not required_torch_version(min_version=1.8):
             pytest.skip("DeepSpeed MoE tests need torch 1.8 or higher to run correctly")
 
@@ -61,11 +63,20 @@ class TestMoECheckpoint(DistributedTest):
             },
             "zero_optimization": {
                 "stage": 2,
+                "reduce_scatter": True
+            },
+            "compile": {
+                "enabled": compile_mode,
+                "backend": get_accelerator().get_compile_backend()
             }
         }
         hidden_dim = 16
+        fp16 = config_dict["fp16"]["enabled"]
 
         models = [SimpleMoEModel(hidden_dim=hidden_dim, num_experts=ep_size, ep_size=ep_size) for _ in range(2)]
+        if hpu_lazy_enabled():
+            device = get_accelerator().device_name()
+            models = [model.to(device) for model in models]
         # param group must have a random unique name (for now)
         # TODO: clean-up this requirement, the unique name should not be required here
         param_groups = [{'params': [p for p in model.parameters()], 'name': 'random-unique-name'} for model in models]
@@ -77,7 +88,7 @@ class TestMoECheckpoint(DistributedTest):
                                             tmpdir=tmpdir,
                                             load_optimizer_states=load_optim_states,
                                             load_lr_scheduler_states=False,
-                                            fp16=config_dict["fp16"]["enabled"],
+                                            fp16=fp16,
                                             empty_tag=True,
                                             base_optimizers=optimizers,
                                             seq_dataloader=True)

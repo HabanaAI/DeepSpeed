@@ -22,6 +22,7 @@ if not (hasattr(torch.version, 'hip') and torch.version.hip is not None):
 else:
     HAS_TRITON = False
 
+from .utils import log_dist, OnDevice, logger
 from . import ops
 from . import module_inject
 
@@ -38,11 +39,9 @@ from .runtime.activation_checkpointing import checkpointing
 from .ops.transformer import DeepSpeedTransformerLayer, DeepSpeedTransformerConfig
 from .module_inject import replace_transformer_layer, revert_transformer_layer
 
-from .utils import log_dist, OnDevice, logger
 from .comm.comm import init_distributed
 
 from .runtime import zero
-from .runtime import DeepSpeedOptimizer, ZeROOptimizer
 from .runtime.compiler import is_compile_supported
 
 from .pipe import PipelineModule

@@ -7,8 +7,11 @@ import torch
 import torch.nn as nn
 
 import deepspeed
+import pytest
 from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
 from unit.common import DistributedTest
+from unit.util import hpu_lazy_enabled
+from deepspeed.accelerator import get_accelerator
 
 
 class ModelWithSharedWeights(nn.Module):
@@ -25,17 +28,24 @@ class ModelWithSharedWeights(nn.Module):
 class TestCheckpointSharedWeights(DistributedTest):
     world_size = 2
 
-    def test_checkpoint_shared_weights(self, tmp_path):
+    @pytest.mark.parametrize('compile_mode', [True, False])
+    def test_checkpoint_shared_weights(self, tmp_path, compile_mode):
         config = {
             "train_micro_batch_size_per_gpu": 2,
             "zero_allow_untested_optimizer": True,
             "zero_optimization": {
                 "stage": 2
             },
+            "compile": {
+                "enabled": compile_mode,
+                "backend": get_accelerator().get_compile_backend()
+            }
         }
         model = ModelWithSharedWeights()
+        if hpu_lazy_enabled():
+            device = get_accelerator().current_device_name()
+            model.to(device)
         optimizer = torch.optim.Adam(model.parameters())
-
         deepspeed_engine, _, _, _ = deepspeed.initialize(
             config=config,
             model=model,

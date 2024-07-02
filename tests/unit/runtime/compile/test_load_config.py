@@ -29,7 +29,7 @@ if deepspeed.is_compile_supported():
     def custom_compiler_fn(module: torch.nn.Module):
         global custom_compler_fn_called
         custom_compler_fn_called = True
-        return torch.compile(module)
+        return torch.compile(module, backend=get_accelerator().get_compile_backend())
 
 
 @pytest.fixture
@@ -47,7 +47,7 @@ def base_config():
         },
         "compile": {
             "enabled": True,
-            "backend": "inductor"
+            "backend": get_accelerator().get_compile_backend()
         }
     }
     return config_dict
