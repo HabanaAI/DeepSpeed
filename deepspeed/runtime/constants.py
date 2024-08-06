@@ -131,6 +131,25 @@ BFLOAT16_IMMEDIATE_GRAD_UPDATE = "immediate_grad_update"
 BFLOAT16_IMMEDIATE_GRAD_UPDATE_DEFAULT = False
 
 #########################################
+# FP8 optimizer support
+#########################################
+# By default, this feature is not enabled.
+# Users can configure in ds_config.json as below example:
+FP8_FORMAT = '''
+FP8 parameters should be of the format:
+"fp8_optimizer": {
+  "enabled": true
+}
+'''
+FP8_OPTIMIZER = "fp8_optimizer"
+
+FP8_OPTIMIZER_ENABLED = "enabled"
+FP8_OPTIMIZER_ENABLED_DEFAULT = False
+
+FP8_OPTIMIZER_MASTER_WEIGHTS_DTYPE = "master_weights_dtype"
+FP8_OPTIMIZER_MASTER_WEIGHTS_DTYPE_DEFAULT = "fp32"
+
+#########################################
 # FP16 support
 #########################################
 # FP16 feature. By default, this feature is not enabled.

@@ -4,10 +4,10 @@
 # DeepSpeed Team
 
 import pytest
+import torch
 from unit.common import DistributedTest
 from unit.simple_model import UnusedParametersModel, random_dataloader
 from deepspeed.ops.op_builder import CPUAdamBuilder
-
 import deepspeed
 
 
@@ -42,11 +42,16 @@ class TestStage2IgnoreUnusedParameters(DistributedTest):
             }
         }
         hidden_dim = 4
+        dtype = torch.half
 
         model = UnusedParametersModel(hidden_dim=hidden_dim)
         model, _, _, _ = deepspeed.initialize(config=config_dict, model=model, model_parameters=model.parameters())
 
-        data_loader = random_dataloader(model=model, total_samples=10, hidden_dim=hidden_dim, device=model.device)
+        data_loader = random_dataloader(model=model,
+                                        total_samples=10,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device,
+                                        dtype=dtype)
 
         def _loop():
             for n, batch in enumerate(data_loader):

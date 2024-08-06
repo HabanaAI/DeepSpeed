@@ -80,7 +80,7 @@ class DeepSpeedAccelerator(ABC):
         ...
 
     @abc.abstractmethod
-    def initial_seed(self, seed):
+    def initial_seed(self):
         ...
 
     @abc.abstractmethod
@@ -278,6 +278,10 @@ class DeepSpeedAccelerator(ABC):
     # return an op builder class, specified by class_name
     @abc.abstractmethod
     def get_op_builder(self, class_name):
+        ...
+
+    @abc.abstractmethod
+    def get_compile_backend(self):
         ...
 
     @abc.abstractmethod

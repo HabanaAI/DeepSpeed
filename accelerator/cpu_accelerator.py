@@ -85,8 +85,8 @@ class CPU_Accelerator(DeepSpeedAccelerator):
     def manual_seed_all(self, seed):
         return torch.manual_seed(seed)
 
-    def initial_seed(self, seed):
-        return torch.initial_seed(seed)
+    def initial_seed(self):
+        return torch.initial_seed()
 
     def default_generator(self, device_index):
         return torch.default_generator
@@ -302,3 +302,6 @@ class CPU_Accelerator(DeepSpeedAccelerator):
 
     def export_envs(self):
         return []
+
+    def get_compile_backend(self):
+        return "inductor"

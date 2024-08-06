@@ -6,8 +6,14 @@
 import torch
 import deepspeed
 import numpy as np
+import pytest
 from unit.common import DistributedTest
 from unit.simple_model import SimpleModel
+from deepspeed.ops.op_builder import FusedLambBuilder
+from deepspeed.accelerator import get_accelerator
+
+if torch.half not in get_accelerator().supported_dtypes():
+    pytest.skip(f"fp16 not supported, valid dtype: {get_accelerator().supported_dtypes()}", allow_module_level=True)
 
 
 def run_model_step(model, gradient_list):
@@ -38,6 +44,7 @@ class TestFused(DistributedTest):
                 "loss_scale_window": 2
             }
         }
+
         hidden_dim = 1
         model = SimpleModel(hidden_dim)
         model, optim, _, _ = deepspeed.initialize(config=config_dict, model=model, model_parameters=model.parameters())
@@ -143,6 +150,7 @@ class TestFused(DistributedTest):
         assert optim.cur_iter == expected_iteration
 
 
+@pytest.mark.skipif(not deepspeed.ops.__compatible_ops__[FusedLambBuilder.NAME], reason="lamb is not compatible")
 class TestUnfused(DistributedTest):
     world_size = 1
 

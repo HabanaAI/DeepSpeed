@@ -14,6 +14,7 @@ import deepspeed.comm as dist
 from huggingface_hub import snapshot_download
 from transformers.utils import is_offline_mode
 from deepspeed.ops.op_builder import InferenceBuilder
+from deepspeed.accelerator import get_accelerator
 
 if not deepspeed.ops.__compatible_ops__[InferenceBuilder.NAME]:
     pytest.skip("This op had not been implemented on this system.", allow_module_level=True)
@@ -44,6 +45,8 @@ def model_name(request):
 
 @pytest.fixture(params=[torch.float16, torch.int8], ids=["fp16", "int8"])
 def dtype(request):
+    if request.param not in get_accelerator().supported_dtypes():
+        pytest.skip(f"{request.param} not supported by {get_accelerator().device_name()}.")
     return request.param
 
 
@@ -73,7 +76,9 @@ class save_shard(DistributedFixture):
 class TestCheckpointShard(DistributedTest):
     world_size = 2
 
-    def test(self, model_name, dtype, class_tmpdir, save_shard):
+    @pytest.mark.parametrize('compile_mode', [True, False])
+    def test(self, model_name, dtype, class_tmpdir, save_shard, compile_mode):
+
         world_size = int(os.getenv("WORLD_SIZE", "1"))
         inf_config = {
             "replace_with_kernel_inject": True,
@@ -92,6 +97,8 @@ class TestCheckpointShard(DistributedTest):
             model = AutoModelForCausalLM.from_config(model_config, torch_dtype=torch.bfloat16)
         model = model.eval()
         model = deepspeed.init_inference(model, config=inf_config)
+        if compile_mode:
+            model.compile()
         check_dtype(model, dtype)
 
 
@@ -99,7 +106,8 @@ class TestCheckpointShard(DistributedTest):
 class TestCheckpointShardinAutoTP(DistributedTest):
     world_size = 2
 
-    def test(self, model_name, class_tmpdir):
+    @pytest.mark.parametrize('compile_mode', [True, False])
+    def test(self, model_name, class_tmpdir, compile_mode):
 
         def write_checkpoints_json(model_name, class_tmpdir):
             import json
@@ -137,3 +145,5 @@ class TestCheckpointShardinAutoTP(DistributedTest):
             model = AutoModelForCausalLM.from_config(model_config, torch_dtype=torch.bfloat16)
         model = model.eval()
         model = deepspeed.init_inference(model, config=inf_config)
+        if compile_mode:
+            model.compile()

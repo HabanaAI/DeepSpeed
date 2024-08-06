@@ -9,6 +9,7 @@ import pytest
 import json
 import hjson
 import argparse
+import torch
 
 from deepspeed.runtime.zero.config import DeepSpeedZeroConfig
 from deepspeed.accelerator import get_accelerator
@@ -163,11 +164,15 @@ class TestConfigLoad(DistributedTest):
     world_size = 1
 
     def test_dict(self, base_config):
+        dtype = torch.half
+
         hidden_dim = 10
         model = SimpleModel(hidden_dim)
         model, _, _, _ = deepspeed.initialize(config=base_config, model=model, model_parameters=model.parameters())
 
     def test_json(self, base_config, tmpdir):
+        dtype = torch.half
+
         config_path = os.path.join(tmpdir, "config.json")
         with open(config_path, 'w') as fp:
             json.dump(base_config, fp)
@@ -176,6 +181,8 @@ class TestConfigLoad(DistributedTest):
         model, _, _, _ = deepspeed.initialize(config=config_path, model=model, model_parameters=model.parameters())
 
     def test_hjson(self, base_config, tmpdir):
+        dtype = torch.half
+
         config_path = os.path.join(tmpdir, "config.json")
         with open(config_path, 'w') as fp:
             hjson.dump(base_config, fp)
@@ -188,6 +195,8 @@ class TestDeprecatedDeepScaleConfig(DistributedTest):
     world_size = 1
 
     def test(self, base_config, tmpdir):
+
+        dtype = torch.half
         config_path = create_config_from_dict(tmpdir, base_config)
         parser = argparse.ArgumentParser()
         args = parser.parse_args(args='')
@@ -198,7 +207,11 @@ class TestDeprecatedDeepScaleConfig(DistributedTest):
 
         model = SimpleModel(hidden_dim)
         model, _, _, _ = deepspeed.initialize(args=args, model=model, model_parameters=model.parameters())
-        data_loader = random_dataloader(model=model, total_samples=5, hidden_dim=hidden_dim, device=model.device)
+        data_loader = random_dataloader(model=model,
+                                        total_samples=5,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device,
+                                        dtype=dtype)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
             model.backward(loss)
@@ -210,13 +223,18 @@ class TestDistInit(DistributedTest):
 
     def test(self, base_config):
         hidden_dim = 10
+        dtype = torch.half
 
         model = SimpleModel(hidden_dim)
         model, _, _, _ = deepspeed.initialize(config=base_config,
                                               model=model,
                                               model_parameters=model.parameters(),
                                               dist_init_required=True)
-        data_loader = random_dataloader(model=model, total_samples=5, hidden_dim=hidden_dim, device=model.device)
+        data_loader = random_dataloader(model=model,
+                                        total_samples=5,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device,
+                                        dtype=dtype)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
             model.backward(loss)
@@ -229,11 +247,15 @@ class TestInitNoOptimizer(DistributedTest):
     def test(self, base_config):
         del base_config["optimizer"]
         hidden_dim = 10
-
+        dtype = torch.half
         model = SimpleModel(hidden_dim=hidden_dim)
 
         model, _, _, _ = deepspeed.initialize(config=base_config, model=model)
-        data_loader = random_dataloader(model=model, total_samples=5, hidden_dim=hidden_dim, device=model.device)
+        data_loader = random_dataloader(model=model,
+                                        total_samples=5,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device,
+                                        dtype=dtype)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
             with pytest.raises(AssertionError):
@@ -246,16 +268,20 @@ class TestArgs(DistributedTest):
     world_size = 1
 
     def test_none_args(self, base_config):
+        dtype = torch.half
+
         model = SimpleModel(hidden_dim=10)
         model, _, _, _ = deepspeed.initialize(args=None, model=model, config=base_config)
-        data_loader = random_dataloader(model=model, total_samples=5, hidden_dim=10, device=model.device)
+        data_loader = random_dataloader(model=model, total_samples=5, hidden_dim=10, device=model.device, dtype=dtype)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
 
     def test_no_args(self, base_config):
+        dtype = torch.half
+
         model = SimpleModel(hidden_dim=10)
         model, _, _, _ = deepspeed.initialize(model=model, config=base_config)
-        data_loader = random_dataloader(model=model, total_samples=5, hidden_dim=10, device=model.device)
+        data_loader = random_dataloader(model=model, total_samples=5, hidden_dim=10, device=model.device, dtype=dtype)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
 
@@ -265,6 +291,7 @@ class TestNoModel(DistributedTest):
 
     def test(self, base_config):
         model = SimpleModel(hidden_dim=10)
+
         with pytest.raises(AssertionError):
             model, _, _, _ = deepspeed.initialize(model=None, config=base_config)
 

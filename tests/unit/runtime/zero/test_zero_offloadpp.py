@@ -6,11 +6,8 @@ import pytest
 import deepspeed.comm as dist
 from unit.common import DistributedTest
 from unit.simple_model import random_dataloader
-
 import deepspeed
-
 from deepspeed.runtime.zero.offload_config import DeepSpeedZeroOffloadOptimizerConfig
-
 import torch.nn as nn
 
 

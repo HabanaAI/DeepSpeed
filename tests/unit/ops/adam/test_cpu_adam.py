@@ -11,7 +11,7 @@ from cpuinfo import get_cpu_info
 import deepspeed
 from deepspeed.accelerator import get_accelerator
 from deepspeed.ops.adam import FusedAdam
-from deepspeed.ops.op_builder import CPUAdamBuilder
+from deepspeed.ops.op_builder import CPUAdamBuilder, FusedAdamBuilder
 from unit.common import DistributedTest
 
 if not deepspeed.ops.__compatible_ops__[CPUAdamBuilder.NAME]:
@@ -21,8 +21,8 @@ pytest.cpu_vendor = get_cpu_info()["vendor_id_raw"].lower()
 
 
 def check_equal(first, second, atol=1e-2, verbose=False):
-    x = first.detach().numpy()
-    y = second.detach().numpy()
+    x = first.detach().float().numpy()
+    y = second.detach().float().numpy()
     print("ATOL", atol)
     if verbose:
         print("x = {}".format(x.flatten()))
@@ -62,6 +62,8 @@ class TestCPUAdam(DistributedTest):
         set_dist_env = False
 
     @pytest.mark.skipif(not get_accelerator().is_available(), reason="only supported in CUDA environments.")
+    @pytest.mark.skipif(not deepspeed.ops.__compatible_ops__[FusedAdamBuilder.NAME],
+                        reason="FusedAdam is not compatible")
     def test_fused_adam_equal(self, dtype, model_size):
         if ("amd" in pytest.cpu_vendor) and (dtype == torch.half):
             pytest.skip("cpu-adam with half precision not supported on AMD CPUs")
@@ -89,6 +91,8 @@ class TestCPUAdam(DistributedTest):
 
     def test_torch_adamw_equal(self, dtype, model_size):
         if get_accelerator().is_available():
+            if dtype == torch.half:
+                pytest.skip("torch.optim.AdamW with half precision inf/nan output.")
             if ("amd" in pytest.cpu_vendor) and (dtype == torch.half):
                 pytest.skip("cpu-adam with half precision not supported on AMD CPUs")
             ref_param_device = get_accelerator().device_name()

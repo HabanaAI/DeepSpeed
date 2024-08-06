@@ -5,9 +5,14 @@
 
 import torch
 import deepspeed
+import pytest
 from pytest import approx
 from unit.common import DistributedTest
 from unit.multi_output_model import MultiOutputModel, multi_output_dataloader
+from deepspeed.accelerator import get_accelerator
+
+if torch.half not in get_accelerator().supported_dtypes():
+    pytest.skip(f"fp16 not supported, valid dtype: {get_accelerator().supported_dtypes()}", allow_module_level=True)
 
 
 class TestTwoOutputModel(DistributedTest):
@@ -35,7 +40,6 @@ class TestTwoOutputModel(DistributedTest):
 
         hidden_dim = 10
         weight_value = 0.1
-
         model = MultiOutputModel(hidden_dim, weight_value)
         model, _, _, _ = deepspeed.initialize(config=config_dict, model=model, model_parameters=model.parameters())
         total_samples = 4
