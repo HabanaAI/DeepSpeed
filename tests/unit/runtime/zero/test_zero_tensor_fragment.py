@@ -120,6 +120,7 @@ class TestTensorFragmentGet(DistributedTest):
                 "stage": zero_stage,
             }
         }
+        dtype = torch.float16
 
         if offload_device == OffloadDeviceEnum.cpu:
             config_dict["zero_optimization"]["offload_optimizer"] = {"device": offload_device}
@@ -131,7 +132,7 @@ class TestTensorFragmentGet(DistributedTest):
 
         hidden_dim = 128
         if zero_stage == 3:
-            with deepspeed.zero.Init(config_dict_or_path=config_dict):
+            with deepspeed.zero.Init(config_dict_or_path=config_dict, dtype=dtype):
                 model = MyModel(hidden_dim, frozen_weights)
         else:
             model = MyModel(hidden_dim, frozen_weights)
@@ -305,7 +306,6 @@ class TestTensorFragmentUpdate(DistributedTest):
             config_dict["fp16"] = {"enabled": True, "initial_scale_power": 8}
         elif dtype == torch.bfloat16:
             config_dict["bf16"] = {"enabled": True}
-
         hidden_dim = 128
         if zero_stage == 3:
             config_dict["zero_optimization"]["param_persistence_threshold"] = hidden_dim

@@ -11,13 +11,15 @@ from torch.optim.lr_scheduler import _LRScheduler, LambdaLR
 
 from unit.simple_model import SimpleModel, random_dataloader
 from unit.common import DistributedTest
-from unit.util import bf16_required_version_check, required_amp_check
+from unit.util import bf16_required_version_check, required_amp_check, hpu_lazy_enabled
 
 import deepspeed
 from deepspeed.ops.adam import FusedAdam
 from deepspeed.runtime.lr_schedules import WARMUP_LR, WarmupLR
 from deepspeed.runtime.config import ADAM_OPTIMIZER
 from deepspeed.runtime.utils import see_memory_usage, required_torch_version
+from deepspeed.accelerator import get_accelerator
+from deepspeed.ops.op_builder import FusedAdamBuilder
 
 
 @pytest.mark.parametrize('zero_stage', [0, 3])
@@ -43,6 +45,7 @@ class TestNoOptim(DistributedTest):
         # 20B test
         #hidden_dim = 16 * 1024
         hidden_dim = 4
+        dtype = torch.half
 
         with deepspeed.zero.Init(enabled=zero_stage == 3, config_dict_or_path=ds_config):
             model = SimpleModel(hidden_dim, nlayers=78)
@@ -53,7 +56,7 @@ class TestNoOptim(DistributedTest):
                                         total_samples=50,
                                         hidden_dim=hidden_dim,
                                         device=model.device,
-                                        dtype=torch.half)
+                                        dtype=dtype)
         for batch in data_loader:
             model(batch[0], batch[1])
         see_memory_usage('post-fwds', force=True)
@@ -68,6 +71,9 @@ class TestClientOptimizer(DistributedTest):
         def _optimizer_callable(params) -> Optimizer:
             return AdamW(params=params)
 
+        if (optimizer_type is None) and (not deepspeed.ops.__compatible_ops__[FusedAdamBuilder.NAME]):
+            pytest.skip("FusedAdam is not compatible")
+
         hidden_dim = 10
         model = SimpleModel(hidden_dim)
 
@@ -79,13 +85,13 @@ class TestClientOptimizer(DistributedTest):
             client_optimizer = Adam(model.parameters())
         else:
             client_optimizer = _optimizer_callable
-
         _, ds_optimizer, _, _ = deepspeed.initialize(config=config_dict,
                                                      model=model,
                                                      model_parameters=list(model.parameters()),
                                                      optimizer=client_optimizer)
         if client_optimizer is None:
-            assert isinstance(ds_optimizer, FusedAdam)
+            optim = FusedAdam
+            assert isinstance(ds_optimizer, optim)
         elif isinstance(client_optimizer, Optimizer):
             assert ds_optimizer == client_optimizer
         else:
@@ -96,8 +102,11 @@ class TestClientOptimizer(DistributedTest):
 class TestConfigOptimizer(DistributedTest):
     world_size = 1
 
+    @pytest.mark.skipif(not deepspeed.ops.__compatible_ops__[FusedAdamBuilder.NAME],
+                        reason="FusedAdam is not compatible")
     def test(self, client_parameters):
         ds_config = {"train_batch_size": 1, "optimizer": {"type": "Adam", "params": {"lr": 0.001}}}
+        optimizer = FusedAdam
 
         hidden_dim = 10
         model = SimpleModel(hidden_dim)
@@ -108,8 +117,7 @@ class TestConfigOptimizer(DistributedTest):
             model_parameters = None
 
         _, ds_optimizer, _, _ = deepspeed.initialize(config=ds_config, model=model, model_parameters=model_parameters)
-
-        assert isinstance(ds_optimizer, FusedAdam)
+        assert isinstance(ds_optimizer, optimizer)
 
 
 @pytest.mark.parametrize('optimizer_extension', ['zero1', 'zero2', 'zero3', 'amp', None])
@@ -136,6 +144,8 @@ class TestOptimizerImplementation(DistributedTest):
             pytest.skip(
                 "DeepSpeed BFloat16 tests need torch >= 1.10, NCCL >= 2.10.3, CUDA > =11.0 and HW support for BFloat16 to run correctly"
             )
+        if fp16 and torch.float16 not in get_accelerator().supported_dtypes():
+            pytest.skip(f"FP16 not supported by {get_accelerator().device_name()}")
         if amp and not required_amp_check():
             pytest.skip("Amp is not installed can't run amp check")
         # Config declaration
@@ -222,6 +232,9 @@ class TestOptimizerImplementation(DistributedTest):
 
         hidden_dim = 10
         model = SimpleModel(hidden_dim)
+        # TODO: SW-145674 remove this WA when SW-145671 is resolved.
+        if hpu_lazy_enabled():
+            model.to(get_accelerator().device_name())
         model_parameters = list(model.parameters())
 
         if key in is_supported:

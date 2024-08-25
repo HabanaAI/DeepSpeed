@@ -17,7 +17,6 @@ class TestInferenceConfig(DistributedTest):
     def test_overlap_kwargs(self):
         config = {"replace_with_kernel_inject": True, "dtype": torch.float32}
         kwargs = {"replace_with_kernel_inject": True}
-
         engine = deepspeed.init_inference(torch.nn.Module(), config=config, **kwargs)
         assert engine._config.replace_with_kernel_inject
 

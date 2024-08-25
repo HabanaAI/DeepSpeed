@@ -13,6 +13,7 @@ from torch.nn.modules import Module
 from packaging import version as pkg_version
 from deepspeed.runtime.checkpoint_engine.torch_checkpoint_engine import TorchCheckpointEngine
 from deepspeed.utils.timer import SynchronizedWallClockTimer
+from deepspeed.runtime.compiler import is_compile_supported
 
 from ..runtime.state_dict_factory import SDLoaderFactory
 from ..runtime.weight_quantizer import WeightQuantization
@@ -29,6 +30,7 @@ from ..module_inject.replace_policy import generic_policies
 from ..module_inject.auto_tp_model_utils import build_bloom_alibi_tensor, build_mpt_atten_bias_tensor, build_mpt_alibi_tensor, get_alibi_mask
 from ..ops.transformer.inference.ds_attention import DeepSpeedSelfAttention
 from ..model_implementations.transformers.ds_transformer import DeepSpeedTransformerInference
+from ..ops.transformer.inference.op_binding.workspace import WorkspaceOp
 
 DS_INFERENCE_ENABLED = False
 from torch import nn
@@ -51,13 +53,8 @@ class InferenceEngine(Module):
         DS_INFERENCE_ENABLED = True
 
         super().__init__()
-
-        # Have to import here because inference_module is a global, but python
-        # globals only work at the module level and will not be updated unless
-        # we import it each time we init a new inference engine.
-        from ..model_implementations.transformers.ds_transformer import inference_module
-        if inference_module is not None:
-            self.destroy()
+        self.workspace = WorkspaceOp()
+        self.destroy()
 
         self.module = model
         self._config = config
@@ -180,22 +177,19 @@ class InferenceEngine(Module):
             dist.broadcast(_rng_state, 0)
             get_accelerator().set_rng_state(_rng_state.cpu())
 
-        if config.tensor_parallel.tp_size > 1:
+        if config.enable_cuda_graph and get_accelerator().device_name() == 'hpu':
+            self.module = get_accelerator().wrap_in_hpu_graph(self.module)
+        elif config.tensor_parallel.tp_size > 1:
             assert not config.enable_cuda_graph, "Cuda graph is not supported for model parallelism"
 
         # Check if local CUDA graphs can be created in replacement modules
         self.local_cuda_graph = self._local_cuda_graph_used(self.module)
+        self._is_compiled = False
 
     def destroy(self):
-        # Have to import here because inference_module is a global, but python
-        # globals only work at the module level and will not be updated unless
-        # we import it each time we init a new inference engine.
-        from ..model_implementations.transformers.ds_transformer import inference_module
         DeepSpeedTransformerInference.layer_id = 0
         DeepSpeedSelfAttention.num_layers = 0
-        if inference_module is not None:
-            inference_module.release_workspace()
-            inference_module = None
+        self.workspace.release_workspace()
 
     def profile_model_time(self, use_cuda_events=True):
         if not self.model_profile_enabled and not self._config.enable_cuda_graph:
@@ -321,7 +315,7 @@ class InferenceEngine(Module):
         if self._config.checkpoint is not None and not isinstance(self._config.checkpoint, (str, dict)):
             raise ValueError(f"checkpoint must be None, str or dict, got {type(self._config.checkpoint)}")
 
-        supported_dtypes = [None, torch.half, torch.int8, torch.float]
+        supported_dtypes = [None, torch.half, torch.int8, torch.float, torch.bfloat16]
         if self._config.dtype not in supported_dtypes:
             raise ValueError(f"{self._config.dtype} not supported, valid dtype: {supported_dtypes}")
 
@@ -589,7 +583,8 @@ class InferenceEngine(Module):
             **kwargs: variable length keyword arguments
         """
         start = None
-        if self.model_profile_enabled and get_accelerator().device_name() == 'cuda' and self._config.enable_cuda_graph:
+        if self.model_profile_enabled and (get_accelerator().device_name() == 'cuda' or get_accelerator().device_name() == 'hpu') and \
+           self._config.enable_cuda_graph:
             get_accelerator().synchronize()
             start = time.time()
 
@@ -634,3 +629,19 @@ class InferenceEngine(Module):
                     )
 
         return self.module.generate(*inputs, **kwargs)
+
+    def compile(self, backend=get_accelerator().get_compile_backend(), compile_kwargs={}) -> None:
+        """
+        Compile the module using the specified backend and kwargs.
+        """
+        if not is_compile_supported():
+            raise RuntimeError("compile is not supported in your version of PyTorch.")
+
+        if self._is_compiled:
+            return
+        self.module.compile(backend=backend, **compile_kwargs)
+        self._is_compiled = True
+
+    @property
+    def is_compiled(self) -> bool:
+        return self._is_compiled

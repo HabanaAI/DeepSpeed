@@ -6,7 +6,6 @@
 import torch
 
 from unit.common import DistributedTest
-
 import deepspeed
 
 
@@ -15,7 +14,6 @@ class TestNewClassDeclaredNestingInit(DistributedTest):
 
     def test_new_class_declared_nesting_init(self):
         ds_config = dict(train_batch_size=1, zero_optimization=dict(stage=3))
-
         with deepspeed.zero.Init(config_dict_or_path=ds_config):
 
             class MyModel(torch.nn.Module):

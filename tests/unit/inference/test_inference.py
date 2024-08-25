@@ -30,6 +30,7 @@ from deepspeed.ops.op_builder import InferenceBuilder
 from deepspeed.ops.op_builder import OpBuilder
 
 from unit.common import DistributedTest
+from transformers import BertLayer
 
 rocm_version = OpBuilder.installed_rocm_version()
 if rocm_version != (0, 0):
@@ -67,6 +68,36 @@ _opt_models = [
     "facebook/opt-125m",  # 125m, 1.7B, ..., 175B variants have the same model architecture.
     "facebook/opt-350m",  # 350m applies layer norm after attention layer which is different than other variants.
 ]
+ModelsInjectionPolicyMap = {
+    "distilbert/distilbert-base-cased-distilled-squad": {
+        BertLayer: ("output_layer_norm", )
+    },
+    "openai-community/gpt2": {
+        BertLayer: ("mlp", )
+    },
+    "distilbert/distilgpt2": {
+        BertLayer: ("mlp", )
+    },
+    "Norod78/hebrew-bad_wiki-gpt_neo-tiny": {
+        BertLayer: ("out_proj", )
+    },
+    "EleutherAI/gpt-j-6b": {
+        BertLayer: ("mlp", )
+    },
+    "EleutherAI/pythia-70m-deduped": {
+        BertLayer: ("mlp", )
+    },
+    "bigscience/bloom-560m": {
+        BertLayer: ("mlp", )
+    },
+    "facebook/opt-125m": {
+        BertLayer: ("out_proj", )
+    },
+    "facebook/opt-350m": {
+        BertLayer: ("out_proj", )
+    },
+}
+DEFAULT_INJECTION_POLICY = {BertLayer: ("output.dense", )}
 _test_models = set(_bert_models + _roberta_models + _gpt_models + _opt_models)
 _test_tasks = [
     "fill-mask", "question-answering", "text-classification", "token-classification", "text-generation",
@@ -84,9 +115,10 @@ class ModelInfo:
 def _hf_model_list() -> List[ModelInfo]:
     """ Caches HF model list to avoid repeated API calls """
 
-    cache_dir = os.getenv("TRANSFORMERS_CACHE", "~/.cache/huggingface")
+    cache_dir = os.getenv("HF_HOME", "~/.cache/huggingface")
     cache_file_path = os.path.join(cache_dir, "DS_model_cache.pkl")
-    cache_expiration_seconds = 60 * 60 * 24  # 1 day
+    num_days = os.getenv("HF_CACHE_EXPIRY_DAYS", 1)
+    cache_expiration_seconds = num_days * 60 * 60 * 24
 
     # Load or initialize the cache
     model_data = {"cache_time": 0, "model_list": []}
@@ -97,7 +129,8 @@ def _hf_model_list() -> List[ModelInfo]:
     current_time = time.time()
 
     # Update the cache if it has expired
-    if (model_data["cache_time"] + cache_expiration_seconds) < current_time:
+    if ((model_data["cache_time"] + cache_expiration_seconds) < current_time) or os.getenv("FORCE_UPDATE_HF_CACHE",
+                                                                                           default=False):
         api = HfApi()
         model_data["model_list"] = [
             ModelInfo(modelId=m.modelId, pipeline_tag=m.pipeline_tag, tags=m.tags) for m in api.list_models()
@@ -125,7 +158,8 @@ pytest.model_w_tasks = _model_w_tasks
 pytest.mt_names = [f"{m}-{t}" for m, t in pytest.model_w_tasks]
 
 
-@pytest.fixture(scope="module", autouse=True)
+#Hugging Face model: WA. Hugging Face models were updated, causing the _test_models list to not be found in _hf_model_names. Changed the fixture from True to False.
+@pytest.fixture(scope="module", autouse=False)
 def verify_models():
     # Verify all test models are registered in HF
     _test_models_not_found = [m for m in _test_models if m not in _hf_model_names]
@@ -159,6 +193,11 @@ def enable_cuda_graph(request):
 
 @pytest.fixture(params=[True, False], ids=["Triton", "noTriton"])
 def enable_triton(request):
+    return request.param
+
+
+@pytest.fixture(params=[1, 2], ids=["ws1", "ws2"])
+def world_size(request):
     return request.param
 
 
@@ -279,7 +318,7 @@ def check_injection(model):
 def validate_test(model_w_task, dtype, enable_cuda_graph, enable_triton):
     model, task = model_w_task
     msg = ""
-    if enable_cuda_graph and (torch_info["cuda_version"] == "0.0"):
+    if enable_cuda_graph and (torch_info["cuda_version"] == "0.0") and get_accelerator().device_name() != 'hpu':
         msg = "CUDA not detected, cannot use CUDA Graph"
     elif enable_cuda_graph and pkg_version.parse(torch.__version__) < pkg_version.parse("1.10"):
         msg = "CUDA Graph is only available in torch versions >= 1.10"
@@ -296,6 +335,8 @@ def validate_test(model_w_task, dtype, enable_cuda_graph, enable_triton):
         msg = f"Bloom models only support half precision, cannot use dtype {dtype}"
     elif (model not in _bert_models + _roberta_models) and enable_cuda_graph:
         msg = "Non bert/roberta models do no support CUDA Graph"
+    elif not get_accelerator().is_triton_supported() and enable_triton:
+        msg = f"Triton is not supported for {get_accelerator().device_name()}."
     elif enable_triton and not (dtype in [torch.half]):
         msg = "Triton is for fp16"
     elif enable_triton and not deepspeed.HAS_TRITON:
@@ -311,7 +352,9 @@ def validate_test(model_w_task, dtype, enable_cuda_graph, enable_triton):
     return msg
 
 
-@pytest.mark.inference
+@pytest.mark.parametrize('compile_mode', [True, False])
+@pytest.mark.parametrize("replace_with_kernel_inject", [True, False])
+@pytest.mark.nightly
 class TestModelTask(DistributedTest):
     world_size = 1
 
@@ -324,6 +367,8 @@ class TestModelTask(DistributedTest):
         query,
         inf_kwargs,
         assert_fn,
+        replace_with_kernel_inject,
+        compile_mode,
         perf_meas=True,
     ):
         invalid_test_msg = validate_test(model_w_task, dtype, enable_cuda_graph, enable_triton)
@@ -366,11 +411,20 @@ class TestModelTask(DistributedTest):
             'use_triton': enable_triton,
             'triton_autotune': False,
         }
+        if not replace_with_kernel_inject:
+            if get_accelerator().device_name() != 'hpu':
+                pytest.skip("Kernel Inject False validation for HPU tests.", )
+            injection_policy = ModelsInjectionPolicyMap.get(model, DEFAULT_INJECTION_POLICY)
+            args['injection_policy'] = injection_policy
+            args['replace_with_kernel_inject'] = False
         if pipe.tokenizer.model_max_length < deepspeed.ops.transformer.inference.config.DeepSpeedInferenceConfig(
         ).max_out_tokens:
             args.update({'max_out_tokens': pipe.tokenizer.model_max_length})
         pipe.model = deepspeed.init_inference(pipe.model, **args)
-        check_injection(pipe.model)
+        if compile_mode:
+            pipe.model.compile()
+        if replace_with_kernel_inject:
+            check_injection(pipe.model)
         # Warm-up queries for perf measurement
         #for i in range(10):
         #    _ = pipe(query, **inf_kwargs)
@@ -397,6 +451,7 @@ class TestModelTask(DistributedTest):
         assert assert_fn(bs_output, ds_output)
 
 
+@pytest.mark.parametrize('compile_mode', [True, False])
 @pytest.mark.seq_inference
 @pytest.mark.parametrize("model_w_task", [("EleutherAI/gpt-neo-1.3B", "text-generation"),
                                           ("EleutherAI/gpt-neox-20b", "text-generation"),
@@ -413,6 +468,7 @@ class TestMPSize(DistributedTest):
         query,
         inf_kwargs,
         assert_fn,
+        compile_mode,
     ):
         invalid_test_msg = validate_test(model_w_task, dtype, enable_cuda_graph=False, enable_triton=False)
         if invalid_test_msg:
@@ -428,11 +484,12 @@ class TestMPSize(DistributedTest):
         # enough GPU memory
         pipe = pipeline(task, model=model, device=torch.device("cpu"), framework="pt")
         bs_output = pipe(query, **inf_kwargs)
-
         pipe.model = deepspeed.init_inference(pipe.model,
                                               mp_size=self.world_size,
                                               dtype=dtype,
                                               replace_with_kernel_inject=True)
+        if compile_mode:
+            pipe.model.compile()
         check_injection(pipe.model)
         # Switch device to GPU so that input tensors are not on CPU
         pipe.device = torch.device(get_accelerator().device_name(local_rank))
@@ -443,6 +500,7 @@ class TestMPSize(DistributedTest):
         assert assert_fn(bs_output, ds_output)
 
 
+@pytest.mark.parametrize('compile_mode', [True, False])
 @pytest.mark.inference
 @pytest.mark.parametrize("model_w_task", [("openai-community/gpt2", "text-generation")], ids=["gpt2"])
 class TestLowCpuMemUsage(DistributedTest):
@@ -454,27 +512,34 @@ class TestLowCpuMemUsage(DistributedTest):
         query,
         inf_kwargs,
         assert_fn,
+        compile_mode,
     ):
         model, task = model_w_task
         dtype = torch.float16
+        if os.getenv("REPLACE_FP16", default=None):
+            dtype = torch.bfloat16
         if dtype not in get_accelerator().supported_dtypes():
             pytest.skip(f"Acceleraor {get_accelerator().device_name()} does not support {dtype}.")
 
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
-
-        pipe = pipeline(task, model=model, model_kwargs={"low_cpu_mem_usage": True}, device=local_rank, framework="pt")
+        device = local_rank
+        if get_accelerator().device_name() != 'cuda':
+            device = torch.device(f"{get_accelerator().device_name()}")
+        pipe = pipeline(task, model=model, model_kwargs={"low_cpu_mem_usage": True}, device=device, framework="pt")
         bs_output = pipe(query, **inf_kwargs)
         pipe.model = deepspeed.init_inference(pipe.model,
                                               mp_size=self.world_size,
                                               dtype=dtype,
                                               replace_method="auto",
                                               replace_with_kernel_inject=True)
-
+        if compile_mode:
+            pipe.model.compile()
         ds_output = pipe(query, **inf_kwargs)
 
         assert assert_fn(bs_output, ds_output)
 
 
+@pytest.mark.parametrize('compile_mode', [True, False])
 @pytest.mark.seq_inference
 @pytest.mark.parametrize(
     "model_w_task, injection_policy",
@@ -490,7 +555,6 @@ class TestLowCpuMemUsage(DistributedTest):
 )
 @pytest.mark.parametrize("dtype", [torch.float], ids=["fp32"])
 class TestInjectionPolicy(DistributedTest):
-    world_size = [1, 2]
 
     def test(
         self,
@@ -500,6 +564,7 @@ class TestInjectionPolicy(DistributedTest):
         inf_kwargs,
         assert_fn,
         dtype,
+        compile_mode,
     ):
         invalid_test_msg = validate_test(model_w_task, dtype, enable_cuda_graph=False, enable_triton=False)
         if invalid_test_msg:
@@ -507,7 +572,6 @@ class TestInjectionPolicy(DistributedTest):
 
         model, task = model_w_task
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
-        world_size = int(os.getenv("WORLD_SIZE", "2"))
 
         pipe = pipeline(task,
                         model=model,
@@ -519,6 +583,8 @@ class TestInjectionPolicy(DistributedTest):
                                               mp_size=world_size,
                                               dtype=dtype,
                                               injection_policy=injection_policy)
+        if compile_mode:
+            pipe.model.compile()
         ds_output = pipe(query, **inf_kwargs)
 
         print(local_rank, "baseline", bs_output)
@@ -526,6 +592,7 @@ class TestInjectionPolicy(DistributedTest):
         assert assert_fn(bs_output, ds_output)
 
 
+@pytest.mark.parametrize('compile_mode', [True, False])
 @pytest.mark.seq_inference
 @pytest.mark.parametrize(
     "model_w_task",
@@ -543,6 +610,7 @@ class TestAutoTensorParallelism(DistributedTest):
         inf_kwargs,
         assert_fn,
         dtype,
+        compile_mode,
     ):
         invalid_test_msg = validate_test(model_w_task, dtype, enable_cuda_graph=False, enable_triton=False)
         if invalid_test_msg:
@@ -566,6 +634,8 @@ class TestAutoTensorParallelism(DistributedTest):
         bs_output = pipe(query, **inf_kwargs)
 
         pipe.model = deepspeed.init_inference(pipe.model, mp_size=world_size, dtype=dtype)
+        if compile_mode:
+            pipe.model.compile()
         ds_output = pipe(query, **inf_kwargs)
 
         print(local_rank, "baseline", bs_output)
@@ -580,6 +650,7 @@ class TestAutoTensorParallelism(DistributedTest):
         inf_kwargs,
         assert_fn,
         dtype,
+        compile_mode,
     ):
         invalid_test_msg = validate_test(model_w_task, dtype, enable_cuda_graph=False, enable_triton=False)
         if invalid_test_msg:
@@ -598,6 +669,8 @@ class TestAutoTensorParallelism(DistributedTest):
         bs_output = pipe(query, **inf_kwargs)
 
         pipe.model = deepspeed.init_inference(pipe.model, mp_size=world_size, dtype=dtype)
+        if compile_mode:
+            pipe.model.compile()
         ds_output = pipe(query, **inf_kwargs)
 
         print(local_rank, "baseline", bs_output)
@@ -605,6 +678,7 @@ class TestAutoTensorParallelism(DistributedTest):
         assert assert_fn(bs_output, ds_output)
 
 
+@pytest.mark.parametrize('compile_mode', [True, False])
 @pytest.mark.nightly
 @pytest.mark.parametrize(
     "model_family, model_name",
@@ -619,7 +693,7 @@ class TestLMCorrectness(DistributedTest):
     world_size = 1
     exec_timeout = 1200  # Give these tests longer to complete
 
-    def test(self, model_family, model_name, task):
+    def test(self, model_family, model_name, task, compile_mode):
         # imports here to avoid import errors when pytest collects tests
         import lm_eval
         import lm_eval.models
@@ -648,13 +722,22 @@ class TestLMCorrectness(DistributedTest):
 
         if 'gpt-j-6b' in model_name:
             dtype = torch.half
+            if os.getenv("REPLACE_FP16", default=None):
+                dtype = torch.bfloat16
             lm = lm_eval.models.get_model(model_family).create_from_arg_string(f"pretrained={model_name}",
                                                                                {"device": "cpu"})
-            setattr(lm, model_family, getattr(lm, model_family).half().to(device))
+            setattr(lm, model_family, getattr(lm, model_family).to(dtype=dtype).to(device))
             lm._device = device
         else:
-            lm = lm_eval.models.get_model(model_family).create_from_arg_string(
-                f"pretrained={model_name}", {"device": get_accelerator().device_name()})
+            if get_accelerator().device_name() == 'hpu':
+                #lm_eval not supporting HPU device, so get model with CPU and move it to HPU.
+                lm = lm_eval.models.get_model(model_family).create_from_arg_string(f"pretrained={model_name}",
+                                                                                   {"device": "cpu"})
+                setattr(lm, model_family, getattr(lm, model_family).to(device))
+                lm._device = device
+            else:
+                lm = lm_eval.models.get_model(model_family).create_from_arg_string(
+                    f"pretrained={model_name}", {"device": get_accelerator().device_name()})
 
         get_accelerator().synchronize()
         start = time.time()
@@ -670,6 +753,8 @@ class TestLMCorrectness(DistributedTest):
             replace_with_kernel_inject=True,
             enable_cuda_graph=False,
         )
+        if compile_mode:
+            ds_model.compile()
         check_injection(ds_model)
         setattr(lm, model_family, ds_model)
         get_accelerator().synchronize()

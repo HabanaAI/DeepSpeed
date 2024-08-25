@@ -82,6 +82,8 @@ class TestFlopsProfiler(DistributedTest):
                 "top_modules": 3,
             },
         }
+        dtype = torch.half
+
         hidden_dim = 10
         model = SimpleModel(hidden_dim, empty_grad=False)
 
@@ -91,7 +93,7 @@ class TestFlopsProfiler(DistributedTest):
                                         total_samples=50,
                                         hidden_dim=hidden_dim,
                                         device=model.device,
-                                        dtype=torch.half)
+                                        dtype=dtype)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
             model.backward(loss)

@@ -4,21 +4,20 @@
 # DeepSpeed Team
 
 import torch
-import os
 from deepspeed import comm as dist
 from packaging import version as pkg_version
 from collections import OrderedDict
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-from deepspeed.runtime import ZeROOptimizer
+from deepspeed.runtime.base_optimizer import ZeROOptimizer
 from deepspeed.runtime.fp16.loss_scaler import CreateLossScaler
-from deepspeed.runtime.utils import (bwc_tensor_model_parallel_rank, empty_cache, see_memory_usage, inf,
-                                     is_model_parallel_parameter, align_dense_tensors, all_gather_dp_groups)
-
+from deepspeed.runtime.utils import (empty_cache, see_memory_usage, inf, is_model_parallel_parameter,
+                                     align_dense_tensors, all_gather_dp_groups)
 from deepspeed.runtime.zero.config import ZeroStageEnum
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from deepspeed.utils import logger
+from deepspeed.utils.bwc import bwc_tensor_model_parallel_rank
 from deepspeed.moe.utils import is_moe_param
 from deepspeed.git_version_info import version
 
@@ -1360,7 +1359,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 self.average_tensor(extra_large_grad_reduc.view(-1))
                 self.extra_large_param_to_reduce = None
             else:
-                self.average_tensor(self.ipg_buffer[self.ipg_index])
+                self.average_tensor(self.ipg_buffer[self.ipg_index].narrow(0, 0, self.elements_in_ipg_bucket))
         else:
             self.buffered_reduce_fallback(None,
                                           self.grads_in_ipg_bucket,
@@ -1957,8 +1956,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if self.clip_grad > 0.:
             # norm is in fact norm*scale
             clip = ((total_norm / self.loss_scale) + 1e-6) / self.clip_grad
-            if clip > 1:
-                combined_scale = clip * self.loss_scale
+            clip = torch.clamp(clip, min=1.0)
+            combined_scale = clip * self.loss_scale
 
         for grad in grad_groups_flat:
             if isinstance(grad, list):
@@ -2082,9 +2081,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     # Promote loss scale so it can be retrieved or set via "fp16_optimizer_instance.loss_scale"
     def _get_loss_scale(self):
         if self.custom_loss_scaler:
-            return self.external_loss_scale
+            return float(self.external_loss_scale)
         else:
-            return self.loss_scaler.cur_scale
+            return float(self.loss_scaler.cur_scale)
 
     def _set_loss_scale(self, value):
         self.loss_scaler.cur_scale = value
@@ -2287,31 +2286,12 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self._load_legacy_checkpoint(state_dict_list, load_optimizer_states, load_from_fp32_weights)
 
     def _load_universal_checkpoint(self, checkpoint_folder, load_optimizer_states, load_from_fp32_weights):
-        self._load_hp_checkpoint_state(checkpoint_folder)
+        self.load_hp_checkpoint_state_from_checkpoint_dir("bit16_groups", checkpoint_folder)
 
     @property
     def param_groups(self):
         """Forward the wrapped optimizer's parameters."""
         return self.optimizer.param_groups
-
-    def _load_hp_checkpoint_state(self, checkpoint_dir):
-        checkpoint_dir = os.path.join(checkpoint_dir, "zero")
-        optim_state_path = os.path.join(checkpoint_dir, "optimizer_state.pt")
-        assert os.path.isfile(
-            optim_state_path), f'{optim_state_path} containing optimizer global state is missing! Cannot proceed.'
-        optim_sd = torch.load(optim_state_path)
-        self._load_global_state(optim_sd)
-
-        tp_rank = bwc_tensor_model_parallel_rank(mpu=self.mpu)
-        tp_world_size = self.mpu.get_slice_parallel_world_size() if hasattr(self.mpu, "get_slice_parallel_world_size") \
-                else self.mpu.get_tensor_model_parallel_world_size()
-
-        for i, _ in enumerate(self.optimizer.param_groups):
-            for lp in self.bit16_groups[i]:
-                if lp._hp_mapping is not None:
-                    #print(f"Loading {self.param_names[lp]} {tp_rank=} {tp_world_size=}")
-                    lp.load_hp_checkpoint_state(os.path.join(checkpoint_dir, self.param_names[lp]), tp_rank,
-                                                tp_world_size)
 
     def _load_global_state(self, sd):
         self.loss_scaler = sd.get(LOSS_SCALER, self.loss_scaler)
@@ -2446,7 +2426,9 @@ def estimate_zero2_model_states_mem_needs(total_params,
         gpu_mem = 2 * total_params
         cpu_mem = total_params * max(4 * total_gpus, 16) * additional_buffer_factor
     else:
-        gpu_mem = 4 * total_params + int(16 * total_params / total_gpus)
+        # GPU's total_params multipliers: 2 = params_16bit,
+        # 18 = 2_grads_16bit + 4_grads_32bit + 4_params_32bit + 8_optimizer_states_32bit(momentum and variance)
+        gpu_mem = 2 * total_params + int(18 * total_params / total_gpus)
         cpu_mem = total_params * 4 * num_gpus_per_node * additional_buffer_factor
 
     return int(cpu_mem), int(gpu_mem)

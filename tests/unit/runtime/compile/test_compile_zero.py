@@ -45,10 +45,6 @@ class TestZeRO(DistributedTest):
             },
             "zero_optimization": {
                 "stage": zero_stage,
-            },
-            "compile": {
-                "enabled": True,
-                "backend": "inductor"
             }
         }
 

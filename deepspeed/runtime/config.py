@@ -31,7 +31,6 @@ from .activation_checkpointing.config import DeepSpeedActivationCheckpointingCon
 from ..comm.config import DeepSpeedCommsConfig
 from ..monitor.config import get_monitor_config
 from ..inference.config import WeightQuantConfig
-from .compiler import get_compile_config
 
 from deepspeed import comm as dist
 from deepspeed.runtime.config_utils import DeepSpeedConfigModel
@@ -65,6 +64,8 @@ from .swap_tensor.aio_config import get_aio_config
 
 from .data_pipeline.config import get_data_efficiency_enabled, get_data_efficiency_config, get_curriculum_enabled_legacy, get_curriculum_params_legacy
 from .data_pipeline.constants import *
+
+from ..utils.config import get_timers_config
 
 TENSOR_CORE_ALIGN_SIZE = 8
 
@@ -167,6 +168,26 @@ def get_bfloat16_enabled(param_dict):
         if key in param_dict.keys():
             return get_scalar_param(param_dict[key], BFLOAT16_ENABLED, BFLOAT16_ENABLED_DEFAULT)
     return False
+
+
+def get_fp8_optimizer_enabled(param_dict):
+    if FP8_OPTIMIZER in param_dict.keys():
+        return get_scalar_param(param_dict[FP8_OPTIMIZER], FP8_OPTIMIZER_ENABLED, FP8_OPTIMIZER_ENABLED_DEFAULT)
+    return FP8_OPTIMIZER_ENABLED_DEFAULT
+
+
+def get_fp8_optimizer_master_weights_dtype(param_dict):
+    if FP8_OPTIMIZER in param_dict.keys():
+        val = get_scalar_param(param_dict[FP8_OPTIMIZER], FP8_OPTIMIZER_MASTER_WEIGHTS_DTYPE,
+                               FP8_OPTIMIZER_MASTER_WEIGHTS_DTYPE_DEFAULT)
+        if val == "fp32":
+            return torch.float32
+        elif val == "fp16":
+            return torch.float16
+        elif val == "bf16":
+            return torch.bfloat16
+        raise ValueError(f"Invalid master_weights_dtype. Supported data types: ['fp16', 'bfp16', 'fp32']. Got: {val}")
+    return torch.float32
 
 
 def get_bfloat16_immediate_grad_update(param_dict):
@@ -829,6 +850,8 @@ class DeepSpeedConfig(object):
         self.bfloat16_immediate_grad_update = get_bfloat16_immediate_grad_update(param_dict)
         assert not (self.fp16_enabled
                     and self.bfloat16_enabled), 'bfloat16 and fp16 modes cannot be simultaneously enabled'
+        self.fp8_optimizer_enabled = get_fp8_optimizer_enabled(param_dict)
+        self.fp8_optimizer_master_weights_dtype = get_fp8_optimizer_master_weights_dtype(param_dict)
         self.fp16_master_weights_and_gradients = get_fp16_master_weights_and_grads_enabled(param_dict)
         self.amp_enabled = get_amp_enabled(param_dict)
         self.amp_params = get_amp_params(param_dict)
@@ -909,7 +932,7 @@ class DeepSpeedConfig(object):
         self.weight_quantization_config = WeightQuantConfig(
             **param_dict['weight_quantization']) if 'weight_quantization' in param_dict else None
 
-        self.compile_config = get_compile_config(param_dict)
+        self.timers_config = get_timers_config(param_dict)
 
     def _batch_assertion(self):
 

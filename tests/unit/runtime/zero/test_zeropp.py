@@ -202,7 +202,7 @@ class TestZeroPPConvergence(DistributedTest):
         tokenizer.pad_token = tokenizer.eos_token
 
         # Load and tokenize dataset
-        dataset = load_dataset("wikitext", 'wikitext-103-raw-v1', split='train[:1%]').filter(lambda x: x["text"])
+        dataset = load_dataset("wikitext", 'wikitext-103-raw-v1', split='train[:1%]')
 
         def tokenize_function(examples):
             # Tokenize and ensure 'labels' are the same as 'input_ids'

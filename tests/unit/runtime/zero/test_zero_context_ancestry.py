@@ -67,7 +67,8 @@ class TestSerialParamInit(DistributedTest):
 
     def test_subclass_param_init(self):
         setup_serial_env()
-        with deepspeed.zero.Init(config=config):
+        dtype = None
+        with deepspeed.zero.Init(config=config, dtype=dtype):
             model = Son().cpu()
 
         # test that all params have been partitioned
@@ -107,7 +108,8 @@ class TestDSInitWZinit(DistributedTest):
             def magic(self):
                 return 42
 
-        with deepspeed.zero.Init():
+        dtype = torch.float16
+        with deepspeed.zero.Init(dtype=dtype):
             model = Model()
             engine, *_ = deepspeed.initialize(model=model, config=ds_config, model_parameters=model.parameters())
         assert engine.magic() == 42

@@ -7,15 +7,15 @@ import deepspeed
 
 from unit.common import DistributedTest
 from unit.simple_model import *
-
 import pytest
 
 
 class TestCheckpointValidationTag(DistributedTest):
     world_size = 2
 
+    @pytest.mark.parametrize('compile_mode', [True, False])
     @pytest.mark.parametrize('valid_mode', ["FAIL", "WARN", "IGNORE"])
-    def test_checkpoint_unique_tag(self, tmpdir, valid_mode):
+    def test_checkpoint_unique_tag(self, tmpdir, valid_mode, compile_mode):
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -27,19 +27,22 @@ class TestCheckpointValidationTag(DistributedTest):
             },
             "checkpoint": {
                 "tag_validation": valid_mode
-            }
+            },
         }
         hidden_dim = 10
         model = SimpleModel(hidden_dim)
 
         model, _, _, _ = deepspeed.initialize(config=config_dict, model=model, model_parameters=model.parameters())
+        if compile_mode:
+            model.compile()
         if valid_mode == "FAIL":
             with pytest.raises(AssertionError):
                 model.save_checkpoint(save_dir=tmpdir, tag=f"tag-{dist.get_rank()}")
         else:
             model.save_checkpoint(save_dir=tmpdir, tag=f"tag-{dist.get_rank()}")
 
-    def test_checkpoint_unknown_tag_validation(self, tmpdir):
+    @pytest.mark.parametrize('compile_mode', [True, False])
+    def test_checkpoint_unknown_tag_validation(self, tmpdir, compile_mode):
 
         config_dict = {
             "train_batch_size": 2,
@@ -52,7 +55,7 @@ class TestCheckpointValidationTag(DistributedTest):
             },
             "checkpoint": {
                 "tag_validation": "foo"
-            }
+            },
         }
         hidden_dim = 10
         args = args_from_dict(tmpdir, config_dict)
@@ -60,3 +63,4 @@ class TestCheckpointValidationTag(DistributedTest):
 
         with pytest.raises(deepspeed.DeepSpeedConfigError):
             model, _, _, _ = deepspeed.initialize(config=config_dict, model=model, model_parameters=model.parameters())
+            model.compile()

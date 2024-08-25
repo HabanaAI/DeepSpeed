@@ -5,6 +5,8 @@
 
 import pytest
 import torch
+import os
+import multiprocessing
 from deepspeed.accelerator import get_accelerator, is_current_accelerator_supported
 from deepspeed.git_version_info import torch_info
 from packaging import version as pkg_version
@@ -47,10 +49,13 @@ def bf16_required_version_check(accelerator_check=True):
     cuda_version_available = CUDA_MAJOR >= 11
     nccl_version_available = NCCL_MAJOR > 2 or (NCCL_MAJOR == 2 and NCCL_MINOR >= 10)
     npu_available = get_accelerator().device_name() == 'npu'
+    hpu_available = get_accelerator().device_name() == 'hpu'
 
     if torch_version_available and cuda_version_available and nccl_version_available and accelerator_pass:
         return True
     elif npu_available:
+        return True
+    elif hpu_available:
         return True
     else:
         return False
@@ -76,3 +81,57 @@ def required_amp_check():
         return False
     else:
         return True
+
+
+def worker(proc_id, return_dict):
+    #TODO SW-114787: move to new api outside experimental
+    import habana_frameworks.torch.utils.experimental as htexp
+    deviceType = htexp._get_device_type()
+    if deviceType == htexp.synDeviceType.synDeviceGaudi:
+        return_dict['devicetype'] = "Gaudi"
+    elif deviceType == htexp.synDeviceType.synDeviceGaudi2:
+        return_dict['devicetype'] = "Gaudi2"
+    elif deviceType == htexp.synDeviceType.synDeviceGaudi3:
+        return_dict['devicetype'] = "Gaudi3"
+    else:
+        return_dict['devicetype'] = None
+        assert False, f'Unexpected hpu device Type: {deviceType}'
+
+
+def get_hpu_dev_version():
+    hpu_dev = None
+    if get_accelerator().device_name() != 'hpu':
+        return hpu_dev
+    if os.getenv("DEEPSPEED_UT_HL_DEVICE", default=None):
+        hpu_dev = os.getenv("DEEPSPEED_UT_HL_DEVICE")
+    if hpu_dev not in ["Gaudi", "Gaudi2", "Gaudi3"]:
+        manager = multiprocessing.Manager()
+        return_dict = manager.dict()
+        proc_id = 0
+        multiprocessing.set_start_method("spawn", force=True)
+        p = multiprocessing.Process(target=worker, args=(proc_id, return_dict))
+        p.start()
+        p.join()
+        try:
+            dev_type = return_dict['devicetype']
+        except:
+            assert False, 'Unexpected hpu device Type: {}'.format(return_dict['devicetype'])
+        p.terminate()
+        exit_code = p.exitcode
+        if exit_code:
+            assert False, 'HPU dev type process exit with: {}'.format(exit_code)
+        if dev_type in ["Gaudi", "Gaudi2", "Gaudi3"]:
+            hpu_dev = dev_type
+            os.environ['DEEPSPEED_UT_HL_DEVICE'] = dev_type
+            return dev_type
+        else:
+            assert False, 'Unexpected hpu device Type: {}'.format(return_dict['devicetype'])
+    else:
+        return hpu_dev
+
+
+def hpu_lazy_enabled():
+    if get_accelerator().device_name() == 'hpu':
+        import habana_frameworks.torch.hpu as thpu
+        return thpu.is_lazy()
+    return False

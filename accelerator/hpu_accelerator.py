@@ -40,9 +40,8 @@ class HPU_Accelerator(DeepSpeedAccelerator):
         return True
 
     def device_name(self, device_index=None):
-        if device_index is None:
-            return 'hpu'
-        return 'hpu:{}'.format(device_index)
+        # ignoring device_index.
+        return 'hpu'
 
     def device(self, device_index=None):
         return torch.device(self.device_name(device_index))
@@ -73,13 +72,13 @@ class HPU_Accelerator(DeepSpeedAccelerator):
         return self.hpu.random.get_rng_state()
 
     def manual_seed(self, seed):
-        self.hpu.random.manual_seed(seed)
+        return self.hpu.random.manual_seed(seed)
 
     def manual_seed_all(self, seed):
         self.hpu.random.manual_seed_all(seed)
 
-    def initial_seed(self, seed):
-        self.hpu.random.initial_seed(seed)
+    def initial_seed(self):
+        return self.hpu.random.initial_seed()
 
     def default_generator(self, device_index):
         return self.hpu.random.default_generators[device_index]
@@ -287,6 +286,17 @@ class HPU_Accelerator(DeepSpeedAccelerator):
             return self.class_dict[class_name]
         else:
             return self.class_dict['NotImplementedBuilder'] if 'NotImplementedBuilder' in self.class_dict else None
+
+    def get_compile_backend(self):
+        return "hpu_backend"
+
+    #shall be removed once moving to torch.compile
+    def wrap_in_hpu_graph(self, module):
+        if self.hpu.is_lazy():
+            module = self.hpu.wrap_in_hpu_graph(module)
+        else:
+            print("Warning: hpu graphs in eager mode is not supported, ignoring")
+        return module
 
     def build_extension(self):
         from torch.utils.cpp_extension import BuildExtension
