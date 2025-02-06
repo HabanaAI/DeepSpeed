@@ -187,6 +187,33 @@ class Loading():
                             requires_grad=module.norm.bias.data.requires_grad)
                     module.norm.bias = mp_replace.copy(module.norm.bias, state_dict[prefix + 'bias'])
 
+def compare_architectures(module_a, module_b):
+    """
+    Compare the architectures of two modules.
+
+    Args:
+        module_a (nn.Module): The first module to compare.
+        module_b (nn.Module): The second module to compare.
+
+    Returns:
+        bool: True if the architectures are the same, False otherwise.
+    """
+    if type(module_a) != type(module_b):
+        return False
+
+    children_a = list(module_a.named_children())
+    children_b = list(module_b.named_children())
+
+    if len(children_a) != len(children_b):
+        return False
+
+    for (name_a, child_a), (name_b, child_b) in zip(children_a, children_b):
+        if name_a != name_b:
+            return False
+        if not compare_architectures(child_a, child_b):
+            return False
+
+    return True
 
 class AutoTP():
 
@@ -213,7 +240,7 @@ class AutoTP():
 
     def in_module_list(module, module_list):
         for item in module_list:
-            if type(item).__name__ == type(module).__name__:
+            if compare_architectures(module, item):
                 return True
         return False
 
@@ -338,6 +365,9 @@ class AutoTP():
             return
         weight_shape = child.weight.shape
         mp_replace = ReplaceWithTensorSlicing(mp_group=self.mp_group)
+        # For DeepseekV2, need to skip kv mqa linear replace.
+        if "kv_a_proj_with_mqa" in name:
+            return child
         # For mixtral-7x8b, need to skip MoE gate linear replace.
         if name == "block_sparse_moe.gate":
             return child
