@@ -14,7 +14,7 @@ from ..inference_parameter import InferenceParameter
 
 # Currently have dependency loops for the type hints.
 InferenceModel = Type["InferenceModel"]
-LayerContainer = Type["LayerContainer"]  # noqa: F811
+LayerContainer = Type["LayerContainer"]
 
 MAPPING_KEY = "PARAM_MAPPING"
 PLIST_HELPERS = "_ds_plist_strip_vals"
@@ -161,7 +161,7 @@ class LayerMetaclass(type):
         return instance
 
 
-class LayerContainer(metaclass=LayerMetaclass):  # noqa: F811
+class LayerContainer(metaclass=LayerMetaclass):
     """
     Abstract base class for containing model parameters.
 

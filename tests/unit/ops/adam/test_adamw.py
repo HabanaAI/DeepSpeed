@@ -12,6 +12,7 @@ from deepspeed.ops.adam import DeepSpeedCPUAdam
 from unit.common import DistributedTest
 from unit.simple_model import SimpleModel
 from deepspeed.accelerator import get_accelerator
+from deepspeed.ops.op_builder import FusedAdamBuilder
 
 if torch.half not in get_accelerator().supported_dtypes():
     pytest.skip(f"fp16 not supported, valid dtype: {get_accelerator().supported_dtypes()}", allow_module_level=True)
@@ -67,6 +68,9 @@ class TestAdamConfigs(DistributedTest):
                 "cpu_offload": zero_offload
             }
         }
+        if (resulting_optimizer[0] == FusedAdam) and (not deepspeed.ops.__compatible_ops__[FusedAdamBuilder.NAME]):
+            pytest.skip("FusedAdam is not compatible")
+
         model = SimpleModel(10)
         model, _, _, _ = deepspeed.initialize(config=config_dict,
                                               model=model,

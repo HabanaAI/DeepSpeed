@@ -35,6 +35,8 @@ from deepspeed.accelerator import get_accelerator
 _EXPERT_PARALLEL_GROUP = {}
 # Expert data parallel group that the current rank belongs to.
 _EXPERT_DATA_PARALLEL_GROUP = {}
+# Expert Parallel combined with Tensor Parallel that the current rank belongs to.
+_EXPERT_TENSOR_PARALLEL_GROUP = {}
 # dist world group needs to be cloned for some cases
 _WORLD_GROUP = None
 # ZeRO parameter  partitioning group that the current rank belongs to.
@@ -254,7 +256,36 @@ def _get_expert_parallel_ranks(world_size,
     return expert_parallel_groups, expert_data_parallel_groups
 
 
-def _create_expert_data_and_model_parallel(expert_parallel_size_, mpu, use_data_before_expert_parallel_=False):
+def _get_expert_tensor_parallel_ranks(expert_parallel_groups):
+    # create a dict from each rank to the ep_group ranks it belongs to
+    rank_to_ep_group = {}
+    for ranks in expert_parallel_groups:
+        for rank in ranks:
+            rank_to_ep_group[rank] = ranks
+
+    # go over all tensor groups, rank by rank
+    # for each rank, add the ep_ranks to current tensor group, if not already added
+    # in order to add ep ranks only once, we delete all rank members from rank_to_ep_group
+    global expert_tensor_parallel_world_size
+    world_size = dist.get_world_size()
+    expert_tensor_parallel_groups = []
+    for i in range(world_size // expert_tensor_parallel_world_size):
+        ep_tp_ranks = []
+        for t in range(expert_tensor_parallel_world_size):
+            rank = i * expert_tensor_parallel_world_size + t
+            ep_ranks = rank_to_ep_group.get(rank, [])
+            for r in ep_ranks:
+                rank_to_ep_group.pop(r)
+            ep_tp_ranks.extend(ep_ranks)
+        if ep_tp_ranks:
+            expert_tensor_parallel_groups.append(sorted(ep_tp_ranks))
+    return expert_tensor_parallel_groups
+
+
+def _create_expert_data_and_model_parallel(expert_parallel_size_,
+                                           mpu,
+                                           use_data_before_expert_parallel_=False,
+                                           create_expert_tensor_parallel_group=False):
     """
         Create expert and data parallel groups based on MPU (model parallel) group.
 
@@ -307,6 +338,18 @@ def _create_expert_data_and_model_parallel(expert_parallel_size_, mpu, use_data_
             if rank in list(ranks):
                 _EXPERT_DATA_PARALLEL_GROUP[group_name] = group
 
+        if create_expert_tensor_parallel_group:
+            # calculate ep_tp_groups and validate correct number of groups
+            expert_tensor_parallel_groups = _get_expert_tensor_parallel_ranks(expert_parallel_groups)
+            n_ep_tp_groups = world_size // expert_parallel_size_ // expert_tensor_parallel_world_size
+            assert n_ep_tp_groups == len(expert_tensor_parallel_groups)
+
+            # create groups
+            for ranks in expert_tensor_parallel_groups:
+                group = dist.new_group(ranks)
+                if rank in list(ranks):
+                    _EXPERT_TENSOR_PARALLEL_GROUP[group_name] = group
+
 
 def _get_max_expert_size():
     """Get the maximum ep_size from all the created groups."""
@@ -351,6 +394,18 @@ def _get_expert_data_parallel_group(group_name):
 def _get_expert_data_parallel_group_dict():
     """Get the expert data parallel group dict."""
     return _EXPERT_DATA_PARALLEL_GROUP
+
+
+def _get_expert_tensor_parallel_group(group_name):
+    """Get the expert tensor parallel group the caller rank belongs to."""
+    assert group_name in _EXPERT_TENSOR_PARALLEL_GROUP, \
+        f'expert tensor parallel group is not initialized for {group_name=}'
+    return _EXPERT_TENSOR_PARALLEL_GROUP[group_name]
+
+
+def _get_expert_tensor_parallel_group_dict():
+    """Get the expert tensor parallel group dict."""
+    return _EXPERT_TENSOR_PARALLEL_GROUP
 
 
 def _clone_world_group():

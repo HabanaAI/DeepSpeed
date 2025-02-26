@@ -10,6 +10,8 @@ from unit.common import DistributedTest
 from unit.simple_model import *
 
 from unit.checkpoint.common import checkpoint_correctness_verification
+from unit.util import hpu_lazy_enabled
+from deepspeed.accelerator import get_accelerator
 
 import pytest
 
@@ -38,8 +40,9 @@ class TestMoECheckpoint(DistributedTest):
                                             seq_dataloader=True,
                                             dtype=torch.float16)
 
+    @pytest.mark.parametrize('compile_mode', [True, False])
     @pytest.mark.parametrize("ep_size, load_optim_states", [(4, True), (4, False), (2, True), (2, False)])
-    def test_checkpoint_moe_and_zero(self, tmpdir, ep_size, load_optim_states):
+    def test_checkpoint_moe_and_zero(self, tmpdir, ep_size, load_optim_states, compile_mode):
         if not required_torch_version(min_version=1.8):
             pytest.skip("DeepSpeed MoE tests need torch 1.8 or higher to run correctly")
 
@@ -66,6 +69,9 @@ class TestMoECheckpoint(DistributedTest):
         hidden_dim = 16
 
         models = [SimpleMoEModel(hidden_dim=hidden_dim, num_experts=ep_size, ep_size=ep_size) for _ in range(2)]
+        if hpu_lazy_enabled():
+            device = get_accelerator().device_name()
+            models = [model.to(device) for model in models]
         # param group must have a random unique name (for now)
         # TODO: clean-up this requirement, the unique name should not be required here
         param_groups = [{'params': [p for p in model.parameters()], 'name': 'random-unique-name'} for model in models]
@@ -80,4 +86,5 @@ class TestMoECheckpoint(DistributedTest):
                                             empty_tag=True,
                                             base_optimizers=optimizers,
                                             seq_dataloader=True,
-                                            dtype=torch.float16)
+                                            dtype=torch.float16,
+                                            compile_mode=compile_mode)

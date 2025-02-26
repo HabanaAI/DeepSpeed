@@ -9,6 +9,7 @@ import pytest
 import json
 import hjson
 import argparse
+import torch
 
 from deepspeed.runtime.zero.config import DeepSpeedZeroConfig
 from deepspeed.accelerator import get_accelerator
@@ -254,7 +255,11 @@ class TestInitNoOptimizer(DistributedTest):
         model = SimpleModel(hidden_dim=hidden_dim)
 
         model, _, _, _ = deepspeed.initialize(config=base_config, model=model)
-        data_loader = random_dataloader(model=model, total_samples=5, hidden_dim=hidden_dim, device=model.device)
+        data_loader = random_dataloader(model=model,
+                                        total_samples=5,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device,
+                                        dtype=torch.half)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
             with pytest.raises(AssertionError):

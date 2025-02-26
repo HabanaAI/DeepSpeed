@@ -13,6 +13,7 @@ import argparse
 from torch.optim import Optimizer
 import math
 from deepspeed.utils import logger
+from torch import tensor, is_tensor
 
 LR_SCHEDULE = 'lr_schedule'
 LR_RANGE_TEST = 'LRRangeTest'
@@ -695,7 +696,13 @@ class WarmupLR(object):
         if last_batch_iteration is None:
             last_batch_iteration = self.last_batch_iteration + 1
         self.last_batch_iteration = last_batch_iteration
-        self._last_lr = update_lr(self.optimizer.param_groups, self.get_lr())
+
+        for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
+            # new LR should match the type of current LR for scalar and Tensor LR support
+            if is_tensor(param_group['lr']):
+                lr = tensor(lr, device=param_group['lr'].device)
+            param_group['lr'] = lr
+        self._last_lr = [group['lr'] for group in self.optimizer.param_groups]
 
     def state_dict(self):
         return {'last_batch_iteration': self.last_batch_iteration}

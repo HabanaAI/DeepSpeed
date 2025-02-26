@@ -10,8 +10,10 @@ from torch import nn
 from torch.nn import functional as F
 
 from deepspeed.utils import groups, log_dist
+from deepspeed.utils.bwc import bwc_tensor_model_parallel_world_size
 from .experts import Experts
 from .sharded_moe import MOELayer, TopKGate
+from deepspeed.accelerator import get_accelerator
 
 
 class MoE(nn.Module):
@@ -33,6 +35,10 @@ class MoE(nn.Module):
         use_tutel (bool, optional): default=False, whether to use Tutel optimizations (if installed).
         enable_expert_tensor_parallelism (bool, optional): default=False, whether to use tensor parallelism for experts
         top2_2nd_expert_sampling (bool, optional): default=True, whether to perform sampling for 2nd expert
+        num_capacity_bins (int, optional): default=0, number of capacity bins to use in case of drop_tokens=False
+        capacity_bins_exp_base (float, optional): default=2.0, in case of capacity bins, exponential growing factor for bin width
+        capacity_bins_alignment (int, optional): default=1, in case of capacity bins, required bins alignment
+        configured_capacity_bins (list, optional): default=None, explicit configuration of capacity bin edges
     """
 
     def __init__(self,
@@ -50,7 +56,12 @@ class MoE(nn.Module):
                  use_rts: bool = True,
                  use_tutel: bool = False,
                  enable_expert_tensor_parallelism: bool = False,
-                 top2_2nd_expert_sampling: bool = True) -> None:
+                 top2_2nd_expert_sampling: bool = True,
+                 sequence_parallel: bool = False,
+                 num_capacity_bins: int = 0,
+                 capacity_bins_exp_base: float = 2.0,
+                 capacity_bins_alignment: int = 1,
+                 configured_capacity_bins: Optional[list] = None) -> None:
 
         super(MoE, self).__init__()
 
@@ -61,7 +72,10 @@ class MoE(nn.Module):
         self.expert_group_name = f"ep_size_{self.ep_size}"
         self.num_experts = num_experts
         self.num_local_experts = num_experts // self.ep_size
-
+        self.sequence_parallel = sequence_parallel
+        self.drop_tokens = drop_tokens
+        #TODO SW-179530: remove workaround when issue with lazy is resolved (see SW-179530).
+        expert.to(get_accelerator().device_name())
         log_dist(
             f'Creating MoE layer with num_experts: {num_experts} | num_local_experts: {self.num_local_experts} | expert_parallel_size: {self.ep_size}',
             [0])
@@ -70,14 +84,28 @@ class MoE(nn.Module):
             'Unsupported noisy_gate_policy: ' + noisy_gate_policy
 
         experts = Experts(expert, self.num_local_experts, self.expert_group_name)
-        self.deepspeed_moe = MOELayer(TopKGate(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
-                                               min_capacity, noisy_gate_policy, drop_tokens, use_rts, None,
-                                               top2_2nd_expert_sampling),
+        self.deepspeed_moe = MOELayer(TopKGate(hidden_size,
+                                               num_experts,
+                                               k,
+                                               capacity_factor,
+                                               eval_capacity_factor,
+                                               min_capacity,
+                                               noisy_gate_policy,
+                                               drop_tokens,
+                                               use_rts,
+                                               None,
+                                               top2_2nd_expert_sampling,
+                                               self.sequence_parallel,
+                                               num_capacity_bins,
+                                               capacity_bins_exp_base,
+                                               capacity_bins_alignment,
+                                               configured_bins=configured_capacity_bins),
                                       experts,
                                       self.expert_group_name,
                                       self.ep_size,
                                       self.num_local_experts,
-                                      use_tutel=use_tutel)
+                                      use_tutel=use_tutel,
+                                      sequence_parallel=self.sequence_parallel)
         if self.use_residual:
             self.mlp = expert
             # coefficient is used for weighted sum of the output of expert and mlp
@@ -87,20 +115,31 @@ class MoE(nn.Module):
         self._create_process_groups(use_data_before_expert_parallel_=use_data_before_expert_parallel_)
 
     def _create_process_groups(self, use_data_before_expert_parallel_: bool = False) -> None:
+        # For sequence-parallel + expert-tp + no token-dropping, create a process group with ranks of EP + TP.
+        # This group is required to reduce_max the local token capacity across EP + TP ranks.
+        tp_enabled = bwc_tensor_model_parallel_world_size(groups.mpu) > 1
+        expert_tp_enabled = self.enable_expert_tensor_parallelism and tp_enabled
+        use_ep_tp_group = self.sequence_parallel and not self.drop_tokens and expert_tp_enabled
+
         # Create process group for a layer if needed
         if self.expert_group_name not in groups._get_expert_parallel_group_dict():
             print(f"No existing process group found, creating a new group named: {self.expert_group_name}")
-            if (groups.mpu is None) or (not self.enable_expert_tensor_parallelism):
-                # Condition 1 - no groups.mpu means no tensor parallelism
-                # Condition 2 - disabling expert tensor parallelism on purpose
+            if not expert_tp_enabled:
+                # expert tensor parallelism is disabled, use only expert parallelism and data parallelism
                 groups._create_expert_and_data_parallel(
                     self.ep_size, use_data_before_expert_parallel_=use_data_before_expert_parallel_)
             else:
-                # expert tensor parallelism is enabled
+                # expert tensor parallelism is enabled, use expert, data and tensor parallelism
                 groups._create_expert_data_and_model_parallel(
-                    self.ep_size, mpu=groups.mpu, use_data_before_expert_parallel_=use_data_before_expert_parallel_)
+                    self.ep_size,
+                    mpu=groups.mpu,
+                    use_data_before_expert_parallel_=use_data_before_expert_parallel_,
+                    create_expert_tensor_parallel_group=use_ep_tp_group)
+
         # Set the group handle for the MOELayer (deepspeed_moe) object
         self.deepspeed_moe._set_ep_group(groups._get_expert_parallel_group(self.expert_group_name))
+        if use_ep_tp_group:
+            self.deepspeed_moe._set_ep_tp_group(groups._get_expert_tensor_parallel_group(self.expert_group_name))
 
     def forward(self,
                 hidden_states: torch.Tensor,

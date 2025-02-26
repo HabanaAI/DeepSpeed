@@ -21,8 +21,14 @@ class HPU_Accelerator(DeepSpeedAccelerator):
         self.apply_hpu_workarounds()
         try:
             import habana_frameworks.torch.hpu as hpu
-            hpu.setDeterministic(True)
             self.hpu = hpu
+            # TODO: [SW-215614] remove this WA when SW-208658 is resolved.
+            use_habana_fw_str = os.getenv('DEEPSPEED_USE_HABANA_FRAMEWORKS_DETERMINISTIC_API', default='')
+            if use_habana_fw_str.lower() in ['true', '1']:
+                hpu.setDeterministic(True)
+            else:
+                torch.use_deterministic_algorithms(True)
+
         except ImportError as e:
             raise ValueError(
                 f"HPU_Accelerator requires habana_frameworks.torch.hpu, which is not installed on this system.")
@@ -299,6 +305,14 @@ class HPU_Accelerator(DeepSpeedAccelerator):
         else:
             return self.class_dict['NotImplementedBuilder'] if 'NotImplementedBuilder' in self.class_dict else None
 
+    #shall be removed once moving to torch.compile
+    def wrap_in_hpu_graph(self, module):
+        if self.hpu.is_lazy():
+            module = self.hpu.wrap_in_hpu_graph(module)
+        else:
+            print("Warning: hpu graphs in eager mode is not supported, ignoring")
+        return module
+
     def build_extension(self):
         from torch.utils.cpp_extension import BuildExtension
         return BuildExtension
@@ -307,6 +321,7 @@ class HPU_Accelerator(DeepSpeedAccelerator):
         return []
 
     def visible_devices_envs(self):
+        # TODO SW-195658: remove WA to not return HABANA_VISIBLE_MODULES once SW-195657 is resolved
         # Current way deepspeed set this env var is not applicable with all HPU instances
         # User has to follow instructions in:
         # https://docs.habana.ai/en/latest/PyTorch/Reference/PT_Multiple_Tenants_on_HPU/Multiple_Workloads_Single_Docker.html

@@ -18,7 +18,6 @@ from deepspeed.runtime.swap_tensor.partitioned_param_swapper import PartitionedP
 from deepspeed.utils.debug import debug_module2name_id, debug_param2name_id
 from deepspeed.accelerator import get_accelerator
 import deepspeed.runtime.compiler as compiler
-from deepspeed.runtime.compiler import is_compiling
 
 import logging
 
@@ -93,7 +92,7 @@ class PartitionedParameterCoordinator:
         # keeps track of the number of submodules invoked so far.
         self.__step_id: int = 0
         # network tracing mode
-        self.__trace_mode: ZeRoTraceMode = ZeRoTraceMode.INVALID
+        self.__trace_mode: ZeRoTraceMode = ZeRoTraceMode.RECORD
         # sequence of submodules/parameters in forward pass + backward pass
         self.__submodule_order: Iterable[Module] = []
         self.__param_order: Iterable[__class__.__ParamInTrace] = []
@@ -186,12 +185,8 @@ class PartitionedParameterCoordinator:
                     force=True)
                 self._invalidate_trace()
 
-    @compiler.disable
     def record_module(self, sub_module: Module) -> None:
         """adds sub module to trace"""
-        if is_compiling():
-            return
-
         if not self.is_record_trace():
             raise RuntimeError(f"attempted to record trace when status = {self.__trace_mode}")
 
@@ -199,8 +194,6 @@ class PartitionedParameterCoordinator:
         self.__step_id_module_fetched_for[sub_module.id].append(self.__step_id)
 
     def record_parameters(self, sub_module: Module) -> None:
-        if is_compiling():
-            return
         """adds sub module to trace"""
         if not self.is_record_trace():
             raise RuntimeError(f"attempted to record trace when status = {self.__trace_mode}")
@@ -215,12 +208,8 @@ class PartitionedParameterCoordinator:
         for sub_module in self.__submodule_order:
             self.record_parameters(sub_module)
 
-    @compiler.disable
     def reset_step(self) -> None:
         """indicate that we have completed one fwd+bwd for the model"""
-        if is_compiling():
-            return
-
         self._clean_inflight_param_registry()
 
         if not self.is_complete_trace():  # not self.trace_complete:
@@ -270,7 +259,6 @@ class PartitionedParameterCoordinator:
     Fetching, prefetching, and releasing parameters
     """
 
-    @compiler.disable
     @instrument_w_nvtx
     @torch.no_grad()
     def fetch_sub_module(self, current_submodule: Module, forward: bool) -> None:

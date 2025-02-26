@@ -17,7 +17,6 @@ from torch.nn.parameter import Parameter
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-from contextlib import contextmanager
 
 from typing import Callable, Dict, Union, Iterable, Container
 
@@ -93,15 +92,17 @@ from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoin
 
 from .pipe.module import PipelineModule
 from .utils import get_ma_status
-from .compiler import is_compile_supported
+from .compiler import is_compile_supported, compiled_autograd
 from ..ops.adam import FusedAdam
 from ..moe.sharded_moe import TopKGate, MOELayer
+from ..moe.capacity_bins import optimize_bins
 from ..moe.layer import MoE
 from ..moe.utils import is_moe_param, configure_moe_param_groups
 from ..git_version_info import version
 
 from deepspeed.profiling.flops_profiler.profiler import FlopsProfiler
 from deepspeed.utils.logging import print_json_dist, print_configuration
+from deepspeed.utils.bwc import bwc_tensor_model_parallel_rank
 
 from deepspeed.accelerator import get_accelerator
 
@@ -217,7 +218,6 @@ class DeepSpeedEngine(Module):
         self.loaded_checkpoint_mp_world_size = None
         self.loaded_checkpoint_dp_world_size = None
         self.enable_backward_allreduce = True
-        self.inside_no_sync_ctxt = False
         self.progressive_layer_drop = None
         self.eigenvalue = None
         self.block_eigenvalue = None
@@ -227,6 +227,7 @@ class DeepSpeedEngine(Module):
         self.num_experts = []
         self.gate_modules = []
         self.moe_layers = []
+        self.has_sequence_parallel_params = False
         self._step_applied = False
         self._global_grad_norm = None
         self.use_ds_comm = False  # False --> Use torch.dist, True --> Use ds.comm backend.
@@ -321,6 +322,14 @@ class DeepSpeedEngine(Module):
         elif self.bfloat16_enabled():
             self.optimizer = self._configure_bf16_optimizer(optimizer=None)
 
+        #Sequence parallel related initialization
+        for param in self.module.parameters():
+            if getattr(param, 'sequence_parallel', False):
+                self.has_sequence_parallel_params = True
+                break
+        if self.has_sequence_parallel_params:
+            assert self.mpu is not None, "sequence parallel allreduce only supported with tensor parallel enabled"
+
         # Hook optimizer for snip_momentum pruning
         if hasattr(model, 'pruners'):
             from ..compression.helper import rewrite_optimizer_step
@@ -373,6 +382,9 @@ class DeepSpeedEngine(Module):
         self.unflatten = _unflatten_dense_tensors
 
         self._is_compiled = False
+        self._is_optimizer_compiled = False
+        self._is_compiled_autograd_enabled = False
+        self._compile_kwargs = {}
 
     def _optimized_linear_offload_setup(self):
         self.optimized_linear_base_weight_sharding = False
@@ -501,7 +513,10 @@ class DeepSpeedEngine(Module):
         Returns:
             float: norm
         """
-        return self._global_grad_norm
+        grad_norm = self._global_grad_norm
+        if isinstance(grad_norm, torch.Tensor):
+            grad_norm = grad_norm.item()
+        return grad_norm
 
     def __getattr__(self, name):
         """
@@ -1983,31 +1998,12 @@ class DeepSpeedEngine(Module):
                 grads = None
                 self.buffered_allreduce_fallback(grads=grads, elements_per_buffer=bucket_size)
 
-    @contextmanager
-    def no_sync(self):
-        r"""
-            Context manager to disable gradient reduction during backward pass.
-            This context manager has the following effects on other DeepSpeed features.
-            1. Incompatible with ZeRO stage 2/3 which rely on reduction for gradient partitioning.
-            2. It is illegal to  call engine.step() within the context manager.
-            3. Tracking of gradient accumulation steps is disabled.
-        """
-        assert not self.zero_optimization_partition_gradients(), \
-        f"no_sync context manager is incompatible with gradient partitioning logic of ZeRO stage {self.zero_optimization_stage()}"
-
-        assert not self.inside_no_sync_ctxt, f"no_sync context manager reentry is unsupported"
-
-        self.inside_no_sync_ctxt = True
-        try:
-            yield
-        finally:
-            self.inside_no_sync_ctxt = False
-
     @instrument_w_nvtx
-    def backward(self, loss, release_loss=False, retain_graph=False, scale_wrt_gas=True):
+    def backward(self, loss, allreduce_gradients=True, release_loss=False, retain_graph=False, scale_wrt_gas=True):
         r"""Execute backward pass on the loss
         Arguments:
             loss: Torch tensor on which to execute backward propagation
+            allreduce_gradients: is deprecated, ignored, and will soon be removed'
             retain_graph: bool, default: false
                 forward on user defined choice of retain_graph
         """
@@ -2017,10 +2013,11 @@ class DeepSpeedEngine(Module):
         if self.scale_wrt_gas is not None:
             scale_wrt_gas = self.scale_wrt_gas
 
-        do_gradient_reduction = self.enable_backward_allreduce and not self.inside_no_sync_ctxt
+        if not allreduce_gradients:
+            logger.warning(f"Argument `allreduce_gradients` is deprecated, ignored, and will soon be removed")
 
-        # scale loss w.r.t. gradient accumulation if reduction is not disabled
-        if do_gradient_reduction and self.gradient_accumulation_steps() > 1 and scale_wrt_gas:
+        # scale loss w.r.t. gradient accumulation if needed
+        if self.gradient_accumulation_steps() > 1 and scale_wrt_gas:
             loss = self._scale_loss_by_gas(loss.float())
 
         # Log training loss
@@ -2043,33 +2040,34 @@ class DeepSpeedEngine(Module):
 
         self._start_timers(self.engine_timers.backward_inner_timers)
 
-        if self.zero_optimization():
-            self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
-            self.optimizer.backward(loss, retain_graph=retain_graph)
-        elif self.amp_enabled():
-            # AMP requires delaying unscale when inside gradient accumulation boundaries
-            # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
-            delay_unscale = not self.is_gradient_accumulation_boundary()
-            with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
-                scaled_loss.backward(retain_graph=retain_graph)
-        elif self.fp16_enabled():
-            if self.eigenvalue_enabled():
-                self.optimizer.backward(loss, create_graph=True, retain_graph=True)
-            else:
+        with compiled_autograd(self._is_compiled_autograd_enabled, self._compile_kwargs):
+            if self.zero_optimization():
+                self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
                 self.optimizer.backward(loss, retain_graph=retain_graph)
-        elif self.bfloat16_enabled():
-            self.optimizer.backward(loss)
-        else:
-            if self.eigenvalue_enabled():
-                loss.backward(create_graph=True, retain_graph=True)
+            elif self.amp_enabled():
+                # AMP requires delaying unscale when inside gradient accumulation boundaries
+                # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
+                delay_unscale = not self.is_gradient_accumulation_boundary()
+                with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
+                    scaled_loss.backward(retain_graph=retain_graph)
+            elif self.fp16_enabled():
+                if self.eigenvalue_enabled():
+                    self.optimizer.backward(loss, create_graph=True, retain_graph=True)
+                else:
+                    self.optimizer.backward(loss, retain_graph=retain_graph)
+            elif self.bfloat16_enabled():
+                self.optimizer.backward(loss)
             else:
-                loss.backward(retain_graph=retain_graph)
+                if self.eigenvalue_enabled():
+                    loss.backward(create_graph=True, retain_graph=True)
+                else:
+                    loss.backward(retain_graph=retain_graph)
 
-        self._stop_timers(self.engine_timers.backward_inner_timers)
+            self._stop_timers(self.engine_timers.backward_inner_timers)
 
-        self._start_timers(self.engine_timers.backward_reduce_timers)
+            self._start_timers(self.engine_timers.backward_reduce_timers)
 
-        if do_gradient_reduction:
+        if allreduce_gradients and self.enable_backward_allreduce:
             # Traditional code path that allreduces the module parameter grads
             self.allreduce_gradients()
 
@@ -2205,9 +2203,6 @@ class DeepSpeedEngine(Module):
         r"""Execute the weight update step after forward and backward propagation
         on effective_train_batch.
         """
-        assert not self.inside_no_sync_ctxt, \
-        "It is illegal to call Engine.step() inside no_sync context manager"
-
         see_memory_usage("Engine before step", force=self.memory_breakdown())
 
         # Check early because self.global_steps is incremented at some point here.
@@ -2546,6 +2541,14 @@ class DeepSpeedEngine(Module):
         if self.has_moe_layers:
             self._reduce_expert_gradients(expert_grads, elements_per_buffer)
 
+        if self.has_sequence_parallel_params:
+            for i, group in enumerate(self.optimizer.bf16_groups):
+                for j, lp in enumerate(group):
+                    if getattr(lp, 'sequence_parallel', False):
+                        dist.all_reduce(self.optimizer.fp32_groups_gradients[i][j],
+                                        op=dist.ReduceOp.SUM,
+                                        group=self.mpu.get_slice_parallel_group())
+
     def sparse_allreduce_no_retain(self, bucket, dp_group, dp_world_size=None):
         allreduced_sparses = self.sparse_allreduce_bucket(bucket, dp_group, dp_world_size)
         # Densify sparse tensor and copy back to original location
@@ -2577,9 +2580,10 @@ class DeepSpeedEngine(Module):
             dp_world_size = dist.get_world_size(group=dp_group)
         if self.postscale_gradients():
             if self.gradient_average:
-                values.mul_(self.gradient_predivide_factor() / (dp_world_size))
+
+                values.mul_(self.gradient_predivide_factor() / (dp_world_size / float(self.sequence_parallel_size)))
         else:
-            values.mul_(1. / (dp_world_size))
+            values.mul_(1. / (dp_world_size / float(self.sequence_parallel_size)))
 
         indices_device_list = self.sparse_all_gather(indices, dp_group)
         values_device_list = self.sparse_all_gather(values, dp_group)
@@ -3693,7 +3697,11 @@ class DeepSpeedEngine(Module):
             gc.collect()
             get_accelerator().empty_cache()
 
-    def compile(self, backend=get_accelerator().get_compile_backend(), compile_kwargs={}) -> None:
+    def compile(self,
+                backend=get_accelerator().get_compile_backend(),
+                compile_kwargs={},
+                compile_optimizer_step=False,
+                compiled_autograd_enabled=False) -> None:
         """Compile the module using the specified backend and kwargs.
         If a compiler_fn is set, it will be used instead of torch.compile().
         """
@@ -3712,6 +3720,12 @@ class DeepSpeedEngine(Module):
         # create new dict to avoid modifying original dict
         self.module.compile(**{**compile_kwargs, 'backend': backend})
         self._is_compiled = True
+        if compile_optimizer_step:
+            if not self._is_optimizer_compiled:
+                self.optimizer.step = torch.compile(self.optimizer.step, backend=backend, **compile_kwargs)
+                self._is_optimizer_compiled = True
+        self._is_compiled_autograd_enabled = compiled_autograd_enabled
+        self._compile_kwargs = compile_kwargs
 
     @property
     def is_compiled(self) -> bool:
@@ -3753,3 +3767,84 @@ class DeepSpeedEngine(Module):
         assert self.zero_optimization_stage(
         ) == ZeroStageEnum.weights, "Moving buffers back is supported only for ZeRO stage 3."
         self.optimizer.reload_states(non_blocking=non_blocking)
+
+    def optimize_moe(self, step, max_grouped_experts=1):
+        """ Optimize MoE gate capacity bins
+
+            If MoE is using capacity bins, optimize the bins based on running stats.
+            In order to reduce the number of compilation recipes, we optimize a set
+            of grouped gates together.
+            The grouped gates must have same number of experts.
+        """
+        if not self.has_moe_layers:
+            return
+
+        # find all gates with capacity factor
+        gate_with_capacity_bins_idx = [i for i, gate in enumerate(self.gate_modules) if gate.has_capacity_bins()]
+        if len(gate_with_capacity_bins_idx) == 0:
+            return
+
+        # handle only gates have capacity bins usage statistics
+        gate_capacity_bin_stats = OrderedDict()
+        for i in gate_with_capacity_bins_idx:
+            gate = self.gate_modules[i]
+            if hasattr(gate, 'get_stats'):
+                stats = gate.get_stats(incremental=False)
+                if stats is not None and 'capacity_bins' in stats:
+                    gate_capacity_bin_stats[i] = stats['capacity_bins']
+        if len(gate_capacity_bin_stats) == 0:
+            return
+
+        del gate_with_capacity_bins_idx  # removing the list because it is out of date
+
+        # divide gates into groups up to max_grouped_experts or until different num_experts encountered
+        gate_groups = []
+        first_gate_idx = list(gate_capacity_bin_stats.keys())[0]
+        current_group = [first_gate_idx]
+        current_group_n_experts = self.num_experts[first_gate_idx]
+        for i in list(gate_capacity_bin_stats.keys())[1:]:
+            if self.num_experts[i] == current_group_n_experts and len(current_group) < max_grouped_experts:
+                current_group.append(i)
+            else:
+                gate_groups.append(current_group)
+                current_group = [i]
+                current_group_n_experts = self.num_experts[i]
+        gate_groups.append(current_group)
+
+        # print new optimized groups for each pipeline stage (no sharing across pp stages)
+        dp_rank = dist.get_rank(group=self.mpu.get_data_parallel_group())
+        tp_rank = bwc_tensor_model_parallel_rank(self.mpu)
+        log_ranks = [self.global_rank] if dp_rank == 0 and tp_rank == 0 else []
+
+        # for each group, (1) accumulate stats (2) calculate optimized capacity and (3) reconfigure bins
+        for gate_group in gate_groups:
+            group_stats = []
+            for i in gate_group:
+                group_stats.append(gate_capacity_bin_stats[i])
+
+            # sanity - verify all gates in groups have same bins edges
+            bins_edges = [stats['edges'] for stats in group_stats]
+            same_edges = all(torch.equal(bins_edges[0], tensor) for tensor in bins_edges[1:])
+            assert same_edges, f'Got different capacity bin edges for group={gate_group} edges={bins_edges}'
+
+            # accumulate usage
+            stacked_usage = torch.stack([stats['usage'] for stats in group_stats], dim=0)
+            total_group_usage = torch.sum(stacked_usage, dim=0)
+
+            # find optimized bins for this group
+            min_range = group_stats[0]['min_range']
+            current_bins = group_stats[0]['edges']
+            alignment = group_stats[0]['alignment']
+            min_bin_size = group_stats[0]['min_bin_size']
+            new_bins = optimize_bins(min_range=min_range,
+                                     bins=current_bins,
+                                     bins_usage=total_group_usage,
+                                     alignment=alignment,
+                                     min_bin_size=min_bin_size)
+
+            # configure gates in group with new bins
+            for i in gate_group:
+                gate = self.gate_modules[i]
+                capacity_bins = gate.get_capacity_bins()
+                capacity_bins.set_bins(new_bins)
+            log_dist(f'step={step}, optimize capacity bins for group={gate_group} bins={new_bins}', ranks=log_ranks)

@@ -26,13 +26,17 @@ class Experts(nn.Module):
                 param.group_name = expert_group_name
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        chunks = inputs.chunk(self.num_local_experts, dim=1)
-        expert_outputs: List[torch.Tensor] = []
-
-        for chunk, expert in zip(chunks, self.deepspeed_experts):
-            out = expert(chunk)
+        if inputs.size(1) > 1:  # if E>1 then process group chunks per group
+            chunks = inputs.chunk(self.num_local_experts, dim=1)
+            expert_outputs: List[torch.Tensor] = []
+            for chunk, expert in zip(chunks, self.deepspeed_experts):
+                out = expert(chunk)
+                if isinstance(out, tuple):
+                    out = out[0]  # Ignore the bias term for now
+                expert_outputs += [out]
+            return torch.cat(expert_outputs, dim=1)
+        else:
+            out = self.deepspeed_experts[0](inputs)
             if isinstance(out, tuple):
-                out = out[0]  # Ignore the bias term for now
-            expert_outputs += [out]
-
-        return torch.cat(expert_outputs, dim=1)
+                out = out[0]
+            return out

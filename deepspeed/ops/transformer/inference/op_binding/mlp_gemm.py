@@ -52,6 +52,7 @@ class MLPGemmOp(BaseOp):
 
             return output, residual_add
         else:
+            # TODO: SW-151870 implement mlp_gemm_fallback
             raise NotImplementedError
 
     def rms_mlp_gemm_fallback(self, input, residual, weight_interm, weight_out, gamma, eps, interm_scale, out_scale,

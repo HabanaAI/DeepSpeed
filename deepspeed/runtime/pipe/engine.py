@@ -156,11 +156,33 @@ class PipelineEngine(DeepSpeedEngine):
                 if self.global_rank != min(d['ranks']):
                     tied_params += sum(p.numel() for p in d['module'].parameters())
             unique_params -= tied_params
-        params_tensor = torch.LongTensor(data=[num_params, unique_params]).to(self.device)
+
+        # Use Int32 representation instead of Int64 for calclations.
+        # num_param division & modulo after all reduce should be lower than MAX Int32.
+        # Using this value will be safe if used with less than ~2000 devices.
+        # Int32Max > all_reduce_group*chunk_size
+        chunk_size = 10**6
+
+        num_params_quotient = num_params // chunk_size
+        num_params_remainder = num_params % chunk_size
+
+        unique_params_quotient = unique_params // chunk_size
+        unique_params_remainder = unique_params % chunk_size
+
+        assert (unique_params_quotient * chunk_size +
+                unique_params_remainder) == unique_params, "Value mismatch after Int64 splitting"
+        assert (num_params_quotient * chunk_size +
+                num_params_remainder) == num_params, "Value mismatch after Int64 splitting"
+
+        params_tensor = torch.IntTensor(
+            data=[num_params_quotient, num_params_remainder, unique_params_quotient, unique_params_remainder]).to(
+                self.device)
+
         dist.all_reduce(params_tensor, group=self.grid.get_model_parallel_group())
         params_tensor = params_tensor.tolist()
-        total_params = params_tensor[0]
-        unique_params = params_tensor[1]
+        total_params = params_tensor[0] * chunk_size + params_tensor[1]
+        unique_params = params_tensor[2] * chunk_size + params_tensor[3]
+
         if self.grid.data_parallel_id == 0:
             logger.info(f'RANK={self.global_rank} '
                         f'STAGE={self.stage_id} '
@@ -925,6 +947,7 @@ class PipelineEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers(BATCH_INPUT_TIMER).stop()
 
+    #TODO SW-210169 - align this code with latest Microsoft/DeepSpeed
     def _send_tensor_meta(self, buffer, recv_stage):
         """ Communicate metadata about upcoming p2p transfers.
 
@@ -935,38 +958,51 @@ class PipelineEngine(DeepSpeedEngine):
                 * ndims
                 * shape
         """
-        meta_buffer = torch.empty(TENSOR_META_SIZE, dtype=torch.int32, device=self.device)
+        send_bytes = 0
         if isinstance(buffer, torch.Tensor):
-            meta_buf_list = [
-                0,  # type of data (0: tensor, 1: list (unused), 2: tuple)
-                self.DTYPE_TO_ID[buffer.dtype],  # dtype
-                len(buffer.size())  # ndims
-            ]
-            meta_buf_list.extend(buffer.size())
-            assert len(
-                meta_buf_list
-            ) <= TENSOR_META_SIZE, f"Buffer for metadata is too small. Current buffer size: {TENSOR_META_SIZE} but required {len(meta_buf_list)}"
-            meta_buffer[:len(meta_buf_list)].copy_(torch.tensor(meta_buf_list, dtype=torch.int32))
-            p2p.send(meta_buffer, recv_stage)
-
-        elif isinstance(buffer, tuple):
-            meta_buf_list = [
-                2,  # type of data (0: tensor, 1: list (unused), 2: tuple)
-                len(buffer)  # num_tensors
-            ]
-
+            type_tensor = torch.LongTensor(data=[0]).to(self.device)
+            p2p.send(type_tensor, recv_stage)
+            send_shape = torch.LongTensor(data=buffer.size()).to(self.device)
+            send_ndims = torch.LongTensor(data=[len(buffer.size())]).to(self.device)
+            p2p.send(send_ndims, recv_stage)
+            p2p.send(send_shape, recv_stage)
+            send_bytes += _tensor_bytes(buffer)
+        elif isinstance(buffer, list):
+            assert (False)
+            type_tensor = torch.LongTensor(data=[1]).to(self.device)
+            p2p.send(type_tensor, recv_stage)
+            count_tensor = torch.LongTensor(data=[len(buffer)]).to(self.device)
+            p2p.send(count_tensor, recv_stage)
             for tensor in buffer:
                 assert isinstance(tensor, torch.Tensor)
-                meta_buf_list.append(self.DTYPE_TO_ID[tensor.dtype])
-                meta_buf_list.append(len(tensor.size()))
-                meta_buf_list.extend(tensor.size())
-
-            assert len(
-                meta_buf_list
-            ) <= TENSOR_META_SIZE, f"Buffer for metadata is too small. Current buffer size: {TENSOR_META_SIZE} but required {len(meta_buf_list)}"
-            meta_buffer[:len(meta_buf_list)].copy_(torch.tensor(meta_buf_list, dtype=torch.int32))
-            p2p.send(meta_buffer, recv_stage)
-
+                send_shape = torch.LongTensor(data=tensor.size()).to(self.device)
+                send_ndims = torch.LongTensor(data=[len(tensor.size())]).to(self.device)
+                p2p.send(send_ndims, recv_stage)
+                p2p.send(send_shape, recv_stage)
+                send_bytes += _tensor_bytes(tensor)
+        elif isinstance(buffer, tuple):
+            type_tensor = torch.LongTensor(data=[2]).to(self.device)
+            p2p.send(type_tensor, recv_stage)
+            count_tensor = torch.LongTensor(data=[len(buffer)]).to(self.device)
+            p2p.send(count_tensor, recv_stage)
+            for idx, tensor in enumerate(buffer):
+                assert isinstance(tensor, torch.Tensor)
+                send_shape = torch.LongTensor(data=tensor.size()).to(self.device)
+                send_ndims = torch.LongTensor(data=[len(tensor.size())]).to(self.device)
+                send_dtype = torch.LongTensor(data=[self.DTYPE_TO_ID[tensor.dtype]]).to(self.device)
+                p2p.send(send_dtype, recv_stage)
+                p2p.send(send_ndims, recv_stage)
+                p2p.send(send_shape, recv_stage)
+                # Useful for performance debugging.
+                '''
+                new_bytes = _tensor_bytes(tensor)
+                send_bytes += _tensor_bytes(tensor)
+                # Useful for performance debugging.
+                if self.grid.data_parallel_id == 0:
+                    print(
+                        f'STAGE={self.stage_id} pipe-send-volume[{idx}]: shape={send_shape} {new_bytes/1024**2:0.2f}MB'
+                    )
+                '''
         else:
             raise NotImplementedError(f'Could not send meta type {type(buffer)}')
 
@@ -976,38 +1012,53 @@ class PipelineEngine(DeepSpeedEngine):
             print(f'STAGE={self.stage_id} pipe-send-volume: {send_bytes/1024**2:0.2f}MB')
         '''
 
+    #TODO SW-210169 - align this code with latest Microsoft/DeepSpeed
     def _recv_tensor_meta(self, send_stage):
         """Receive metadata about upcoming p2p transfers and return allocated buffers.
+
+        Metadata is communicated in this order:
+            * type (0: tensor, 1: list)
+            * num_tensors if type=list
+            foreach tensor in buffer:
+                * ndims
+                * shape
 
         Returns:
             Allocated buffer for receiving from send_stage.
         """
-        buffer = torch.empty(TENSOR_META_SIZE, dtype=torch.int32, device=self.device)
-        p2p.recv(buffer, send_stage)
 
-        recv_type = buffer[0].item()
+        type_tensor = torch.LongTensor(data=[0]).to(self.device)
+        p2p.recv(type_tensor, send_stage)
+        recv_type = type_tensor.item()
 
         # A single tensor will be sent.
         if recv_type == 0:
-            recv_dtype = self.ID_TO_DTYPE[buffer[1].item()]
-            recv_ndims = buffer[2].item()
-            recv_shape = buffer[3:3 + recv_ndims].tolist()
-            return self._allocate_or_extend_buffers(0, recv_shape, recv_dtype)
+            recv_ndims = torch.LongTensor(data=[0]).to(self.device)
+            p2p.recv(recv_ndims, send_stage)
+            recv_ndims = recv_ndims.item()
+            recv_shape = torch.LongTensor([1] * recv_ndims).to(self.device)
+            p2p.recv(recv_shape, send_stage)
+            recv_shape = recv_shape.tolist()
+            return self._allocate_buffer(recv_shape, num_buffers=1)[0]
 
-        # List or tuple of tensors (recv_type == 1 (list) is currently unused)
+        # List or tuple of tensors
         elif recv_type == 1 or recv_type == 2:
-            num_tensors = buffer[1].item()
-
-            buffers = []
-            offset = 2
+            count_tensor = torch.LongTensor(data=[0]).to(self.device)
+            p2p.recv(count_tensor, send_stage)
+            num_tensors = count_tensor.item()
+            recv_shapes_and_dtypes = []
             for idx in range(num_tensors):
-                recv_dtype = self.ID_TO_DTYPE[buffer[offset].item()]
-                recv_ndims = buffer[offset + 1].item()
-                recv_shape = buffer[offset + 2:offset + 2 + recv_ndims].tolist()
-                offset += 2 + recv_ndims
+                recv_dtype = torch.LongTensor(data=[0]).to(self.device)
+                p2p.recv(recv_dtype, send_stage)
+                recv_dtype = self.ID_TO_DTYPE[recv_dtype.item()]
+                recv_ndims = torch.LongTensor(data=[0]).to(self.device)
+                p2p.recv(recv_ndims, send_stage)
+                recv_ndims = recv_ndims.item()
+                recv_shape = torch.LongTensor([1] * recv_ndims).to(self.device)
+                p2p.recv(recv_shape, send_stage)
+                recv_shapes_and_dtypes.append((recv_shape.tolist(), recv_dtype))
 
-                buffers.append(self._allocate_or_extend_buffers(idx, recv_shape, recv_dtype))
-
+            buffers = self._allocate_buffers(recv_shapes_and_dtypes, num_buffers=1)[0]
             # Convert to tuples if requested.
             if recv_type == 2:
                 buffers = tuple(buffers)
@@ -1277,6 +1328,17 @@ class PipelineEngine(DeepSpeedEngine):
             num_buffers = self.num_pipe_buffers
         for count in range(num_buffers):
             buffers.append(self._allocate_zeros(shape, **kwargs))
+        return buffers
+
+    def _allocate_buffers(self, shapes_and_dtypes, requires_grad=False, num_buffers=-1):
+        buffers = []
+        if num_buffers == -1:
+            num_buffers = self.num_pipe_buffers
+        for count in range(num_buffers):
+            buffer = []
+            for shape, dtype in shapes_and_dtypes:
+                buffer.append(self._allocate_zeros(shape, dtype=dtype, requires_grad=requires_grad))
+            buffers.append(buffer)
         return buffers
 
     def _allocate_or_extend_buffers(self, idx, shape, dtype):
