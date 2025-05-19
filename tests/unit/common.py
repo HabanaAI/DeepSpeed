@@ -23,7 +23,7 @@ from _pytest.outcomes import Skipped
 from _pytest.fixtures import FixtureLookupError, FixtureFunctionMarker
 
 # Worker timeout for tests that hang
-DEEPSPEED_TEST_TIMEOUT = int(os.environ.get('DS_UNITTEST_TIMEOUT', '600'))
+DEEPSPEED_TEST_TIMEOUT = int(os.environ.get('DEEPSPEED_TEST_TIMEOUT', '600'))
 
 
 def is_rocm_pytorch():
@@ -107,6 +107,15 @@ def set_accelerator_visible():
         elif get_accelerator().device_name() == 'npu':
             npu_smi = subprocess.check_output(['npu-smi', 'info', '-l'])
             num_accelerators = int(npu_smi.decode('utf-8').strip().split('\n')[0].split(':')[1].strip())
+        elif get_accelerator().device_name() == 'hpu':
+            try:
+                hl_smi = subprocess.check_output(['hl-smi', "-L"])
+                num_accelerators = re.findall(r"Module ID\s+:\s+(\d+)", hl_smi.decode())
+            except FileNotFoundError:
+                sim_list = subprocess.check_output(['ls', '-1', '/dev/accel'])
+                num_accelerators = re.findall(r"accel(\d+)", sim_list.decode())
+            num_accelerators = sorted(num_accelerators, key=int)
+            os.environ["HABANA_VISIBLE_MODULES"] = ",".join(num_accelerators)
         else:
             assert get_accelerator().device_name() == 'cpu'
             num_accelerators = _get_cpu_socket_count()

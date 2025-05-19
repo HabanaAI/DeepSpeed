@@ -30,6 +30,7 @@ from deepspeed.utils.timer import SynchronizedWallClockTimer as Timers, FORWARD_
 from deepspeed.utils.bwc import bwc_tensor_model_parallel_rank
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime import compiler
+import os
 
 # DeepSpeed Checkpointing Enabled or Disabled
 deepspeed_checkpointing_enabled = False
@@ -584,6 +585,9 @@ class CheckpointFunction(torch.autograd.Function):
         # removing pointers to the contiguous buffer memory
         # so that they can be garbage collected once the checkpoints
         # have been used
+        if grads[0].device.type == 'hpu':
+            import habana_frameworks.torch as htorch
+            htorch.core.mark_step()
         if SYNCHRONIZE:
             get_accelerator().synchronize()
         if PROFILE_TIME:
@@ -701,7 +705,7 @@ class CheckpointFunction(torch.autograd.Function):
         return tuple(ret_list)
 
 
-def non_reentrant_checkpoint(function, *args):
+def non_reentrant_checkpoint(function, *args, **kwargs):
     """This function is union of `torch.utils.checkpoint._checkpoint_without_reentrant` and `CheckpointFunction` in this module
 
     This function is aim to solve the back probagation error raised from all input requires no grad.
@@ -715,6 +719,9 @@ def non_reentrant_checkpoint(function, *args):
     4. make all after backward blocks in the hook which will executed after all leaf nodes backward execution.
     5. above 4. is inspired by `torch.autograd.graph.register_multi_grad_hook`, which is only implemented after 2.0.0
     """
+    if kwargs.pop("use_torch_checkpoint_fn", False):
+        return torch.utils.checkpoint.checkpoint(function, *args, use_reentrant=False, **kwargs)
+
     global mpu, timers, SYNCHRONIZE, PROFILE_TIME
 
     deepspeed_saved_tensors = None
@@ -944,17 +951,36 @@ def non_reentrant_checkpoint(function, *args):
         return tuple(all_outputs)
 
 
-@compiler.disable  # WA from Pytorch repo for compile + zero 3 accuracy issue
-def checkpoint(function, *args):
+#TODO[SW-187093]: remove once WA in original pytorch code is resolved
+disable_compile_bypass = os.environ.get('HL_DS_DISABLE_CHECKPOINTING_COMPILE_BYPASS', None)
+
+
+def conditional_compile_disable(decorator_func):
+
+    def conditional_decorator(function):
+        global disable_compile_bypass
+        if disable_compile_bypass:
+            return function  # don't use compiler.disable decorator
+        return decorator_func(function)  # use compiler.disable decorator
+
+    return conditional_decorator
+
+
+#TODO[SW-187093]: remove once WA in original pytorch code is resolved
+@conditional_compile_disable(compiler.disable)  # WA from Pytorch repo for compile + zero 3 accuracy issue
+def checkpoint(function, *args, **kwargs):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint. """
 
-    all_outputs = []
-    CheckpointFunction.apply(function, all_outputs, *args)
-    if len(all_outputs) == 1:
-        return all_outputs[0]
+    if kwargs.pop("use_torch_checkpoint_fn", False):
+        return torch.utils.checkpoint.checkpoint(function, *args, use_reentrant=True, **kwargs)
     else:
-        return tuple(all_outputs)
+        all_outputs = []
+        CheckpointFunction.apply(function, all_outputs, *args)
+        if len(all_outputs) == 1:
+            return all_outputs[0]
+        else:
+            return tuple(all_outputs)
 
 
 def partition_activations_in_checkpoint(partition_activation):

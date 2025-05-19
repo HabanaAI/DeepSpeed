@@ -257,8 +257,10 @@ class BloomSelfAttention(DeepSpeedSelfAttention):
         matmul_result = torch.matmul(query_layer, key_layer)
         # change view to [batch_size, num_heads, q_length, k_length]
         attention_scores = matmul_result.view(output_size[0], output_size[1], output_size[2], -1)
-
-        offset = dist.get_rank() * self.num_attention_heads_per_partition if dist.is_initialized() else 0
+        if self.config.mp_size > 1 and dist.is_initialized():
+            offset = dist.get_rank() * self.num_attention_heads_per_partition
+        else:
+            offset = 0
         target_dtype = torch.float16 if self.config.dtype == torch.int8 else self.config.dtype
 
         # When using the hybrid engine with BLOOM, input_mask needs to be converted from torch.bool -> torch.int64

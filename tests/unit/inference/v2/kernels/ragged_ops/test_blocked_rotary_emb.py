@@ -12,7 +12,10 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed.inference.v2.kernels.ragged_ops import BlockedRotaryEmbeddings, BlockedTrainedRotaryEmbeddings
 from deepspeed.inference.v2.ragged import RaggedBatchWrapper, DSSequenceDescriptor
 from .ragged_testing_utils import build_batch_and_manager, validate_kv_cache
-from ....v2.inference_test_utils import allclose
+from ....v2.inference_test_utils import allclose, skip_on_inference_v2
+
+pytestmark = pytest.mark.skipif(skip_on_inference_v2(),
+                                reason=f'Inference V2 not supported by {get_accelerator().device_name()}.')
 """
 NOTE(cmikeh2): It is very possible to see unit test failures (even on FP16) depending on when
 certain values are casted up to or down from float32. If we are seeing accuracy issues, we should

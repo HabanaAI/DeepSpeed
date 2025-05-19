@@ -27,7 +27,7 @@ class DSPolicy(ABC):
     _orig_layer_class = None
 
     def __init__(self):
-        self.cuda_graph_supported = False
+        self.cuda_graph_supported = False if get_accelerator().device_name() != 'hpu' else True
 
     @abstractmethod
     def attention(self):
@@ -62,7 +62,7 @@ class TransformerPolicy(DSPolicy):
             # Type of normalization to perform
             norm_type=NormType.LayerNorm):
         super().__init__()
-        self.cuda_graph_supported = False
+        self.cuda_graph_supported = False if get_accelerator().device_name() != 'hpu' else True
         self.inference = inference
         self.linear_layer = linear_layer
         self.scale_attention = scale_attention

@@ -13,9 +13,10 @@ from deepspeed.checkpoint.ds_to_universal import main as convert_to_universal
 
 from unit.common import DistributedTest, DistributedFixture
 from unit.simple_model import *
-from unit.util import bf16_required_version_check
+from unit.util import bf16_required_version_check, hpu_lazy_enabled
 
 from unit.checkpoint.common import compare_opt_state_dicts, compare_state_dicts
+from deepspeed.accelerator import get_accelerator
 
 import pytest
 import deepspeed.comm as dist
@@ -79,6 +80,9 @@ def train_save_convert(ds_config, hidden_dim, load_optim, use_torch_adam, dtype,
     test_step = 8
 
     model = SimpleModel(hidden_dim)
+    if hpu_lazy_enabled():
+        device = get_accelerator().device_name()
+        model = model.to(device)
     model = init_ds_engine(model, ds_config, use_torch_adam)
     data_loader = random_dataloader(model=model,
                                     total_samples=test_step,
@@ -172,9 +176,10 @@ class baseline_ws4(_baseline):
 @pytest.mark.parametrize("zero_stage", [1, 3])
 @pytest.mark.parametrize("use_torch_adam", [False, True])
 @pytest.mark.parametrize("load_optim", [False, True])
+@pytest.mark.parametrize('compile_mode', [True, False])
 class TestZeROUniversalCheckpointDP(DistributedTest):
 
-    def _run_test(self, tmpdir, dtype, ds_config, load_optim, use_torch_adam):
+    def _run_test(self, tmpdir, dtype, ds_config, load_optim, use_torch_adam, compile_mode):
         if dtype == torch.bfloat16 and not bf16_required_version_check():
             pytest.skip(
                 " DeepSpeed BFloat16 tests need torch >= 1.10, NCCL >= 2.10.3, CUDA > =11.0 and HW support for BFloat16 to run correctly"
@@ -185,7 +190,14 @@ class TestZeROUniversalCheckpointDP(DistributedTest):
 
         ds_config["checkpoint"] = {"load_universal": True}
         univ_model = SimpleModel(hidden_dim)
+        if hpu_lazy_enabled():
+            device = get_accelerator().device_name()
+            univ_model = univ_model.to(device)
+
         univ_model = init_ds_engine(univ_model, ds_config, use_torch_adam)
+        if compile_mode:
+            univ_model.compile()
+
         univ_model.load_checkpoint(tmpdir, tag=f"{CP_TAG}_universal", load_optimizer_states=load_optim)
 
         model_state = univ_model.state_dict()
@@ -215,13 +227,16 @@ class TestZeROUniversalCheckpointDP(DistributedTest):
         univ_model.destroy()
 
     @pytest.mark.world_size(2)
-    def test_dp_world_size_2to2(self, baseline_ws2, tmpdir, dtype, ds_config, load_optim, use_torch_adam):
-        self._run_test(tmpdir, dtype, ds_config, load_optim, use_torch_adam)
+    def test_dp_world_size_2to2(self, baseline_ws2, tmpdir, dtype, ds_config, load_optim, use_torch_adam,
+                                compile_mode):
+        self._run_test(tmpdir, dtype, ds_config, load_optim, use_torch_adam, compile_mode)
 
     @pytest.mark.world_size(2)
-    def test_dp_world_size_4to2(self, baseline_ws4, tmpdir, dtype, ds_config, load_optim, use_torch_adam):
-        self._run_test(tmpdir, dtype, ds_config, load_optim, use_torch_adam)
+    def test_dp_world_size_4to2(self, baseline_ws4, tmpdir, dtype, ds_config, load_optim, use_torch_adam,
+                                compile_mode):
+        self._run_test(tmpdir, dtype, ds_config, load_optim, use_torch_adam, compile_mode)
 
     @pytest.mark.world_size(4)
-    def test_dp_world_size_2to4(self, baseline_ws2, tmpdir, dtype, ds_config, load_optim, use_torch_adam):
-        self._run_test(tmpdir, dtype, ds_config, load_optim, use_torch_adam)
+    def test_dp_world_size_2to4(self, baseline_ws2, tmpdir, dtype, ds_config, load_optim, use_torch_adam,
+                                compile_mode):
+        self._run_test(tmpdir, dtype, ds_config, load_optim, use_torch_adam, compile_mode)

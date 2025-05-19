@@ -14,6 +14,7 @@ from deepspeed import comm as dist
 from deepspeed.utils import groups, z3_leaf_parameter
 
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+import deepspeed.runtime.compiler as compiler
 from deepspeed.runtime.base_optimizer import ZeROOptimizer
 from deepspeed.utils import logger
 from deepspeed.runtime.fp16.loss_scaler import CreateLossScaler
@@ -542,15 +543,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self.grad_partitions_flat_buffer = get_accelerator().pin_memory(self.grad_partitions_flat_buffer)
 
         offset = 0
-        max_partition_numel = 0
         for param in all_params:
             self.__param_id_to_grad_partition[param.ds_id] = self.grad_partitions_flat_buffer.narrow(
                 0, offset, param.partition_numel())
             offset += param.partition_numel()
-            max_partition_numel = max(max_partition_numel, param.partition_numel())
-        if self.offload_optimizer:
-            self.pinned_grad_buffer: Tensor = get_accelerator().pin_memory(
-                torch.empty(max_partition_numel, device=self.device))
 
     def _link_all_hp_params(self):
         for p in self.module.parameters():
@@ -597,8 +593,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         return device_buffer
 
-    def _get_param_coordinator(self):
-        return self.parameter_offload.get_param_coordinator()
+    def _get_param_coordinator(self, training):
+        return self.parameter_offload.get_param_coordinator(training)
 
     def _configure_offloading(self, offload_optimizer_config, offload_param_config):
         ###################### offload optimizer setup ##################################
@@ -1156,7 +1152,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
     def create_reduce_and_remove_grad_hooks(self):
         print_rank_0(f'[Begin] Create gradient reduction hooks')
-        self.grad_accs = []
         self.leaf_parameters = defaultdict(list)
         for i, param_group in enumerate(self.fp16_groups):
             for param in param_group:
@@ -1169,15 +1164,13 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
                     #print(f"After all gather {param.device}, {param.shape}")
                     def wrapper(param):
-                        param_tmp = param.expand_as(param)
-                        grad_acc = param_tmp.grad_fn.next_functions[0][0]
 
                         @instrument_w_nvtx
                         def reduce_partition_and_remove_grads(*notneeded):
                             self.reduce_ready_partitions_and_remove_grads(param)
 
-                        self._grad_acc_hooks.append(grad_acc.register_hook(reduce_partition_and_remove_grads))
-                        self.grad_accs.append(grad_acc)
+                        self._grad_acc_hooks.append(
+                            param.register_post_accumulate_grad_hook(reduce_partition_and_remove_grads))
 
                     #print(f"param grad fn {param.expand_as(param).grad_fn}")
                     if z3_leaf_parameter(param):
@@ -1507,13 +1500,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                         offload_fp32_gradients[i].append(grad_buffer.float())
                         offload_fp32_offsets[i].append(dest_offset)
                     else:
-                        buffer_numel = grad_buffer.numel()
                         fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
-                            0, dest_offset, buffer_numel)
-                        self.pinned_grad_buffer[:buffer_numel].copy_(
-                            grad_buffer.to(dtype=torch.float32, non_blocking=True))
-                        get_accelerator().synchronize()
-                        fp32_grad_tensor.copy_(self.pinned_grad_buffer[:buffer_numel], non_blocking=True)
+                            0, dest_offset, grad_buffer.numel())
+                        fp32_grad_tensor.copy_(grad_buffer.float())
 
             # free the gradient
             if not get_accelerator().is_synchronized_device():
@@ -1878,7 +1867,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         see_memory_usage(f"In step before checking overflow", force=False)
 
         print_rank_0("Finished Tracing at Beginning of Step")
-        self._get_param_coordinator().hierarchy = 0
+        self._get_param_coordinator(training=True).hierarchy = 0
 
         print_rank_0("Finished Tracing at Beginning of Step")
 
@@ -1892,6 +1881,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 norm_groups.append(self.get_grad_norm_direct(self.averaged_gradients[i], self.fp16_groups[i]))
         return norm_groups
 
+    # TODO: remove after SW-207183 is resolved
+    @compiler.disable
     @instrument_w_nvtx
     def _prepare_fp32_grad_for_sub_group(self, sub_group_id):
         partition_id = dist.get_rank(group=self.dp_process_group)
@@ -2262,6 +2253,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         else:
             self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
 
+        self._get_param_coordinator(training=True).reset_step()
+
         if self.swap_optimizer:
             self.optimizer_swapper.post_backward()
 
@@ -2465,9 +2458,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     # Promote loss scale so it can be retrieved or set via "fp16_optimizer_instance.loss_scale"
     def _get_loss_scale(self):
         if self.custom_loss_scaler:
-            return self.external_loss_scale
+            # TODO: SW-187114 Remove WA: cast self.loss_scale to float
+            return float(self.external_loss_scale)
         else:
-            return self.loss_scaler.cur_scale
+            return float(self.loss_scaler.cur_scale)
 
     def _set_loss_scale(self, value):
         self.loss_scaler.cur_scale = value
