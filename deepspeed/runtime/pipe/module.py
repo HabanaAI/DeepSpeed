@@ -662,3 +662,12 @@ class PipelineModule(nn.Module):
          Return a dictionary of {"loss name": loss_value} or None if no additional losses.
         """
         return None
+
+    #TODO(SW-198696) remove workaround for micro offset torch compile issue
+    def compile(self, *args, **kwargs):
+        for idx, layer in enumerate(self.forward_funcs):
+            if isinstance(layer, nn.Module):
+                layer.compile(*args, **kwargs)
+            else:
+                new_layer = torch.compile(layer, *args, **kwargs)
+                self.forward_funcs[idx] = new_layer

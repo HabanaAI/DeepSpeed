@@ -12,7 +12,8 @@ from unit.common import DistributedTest
 from unit.simple_model import SimpleModel, SimpleOptimizer, random_dataloader, SimpleMoEModel, sequence_dataloader
 from deepspeed.utils.torch import required_torch_version
 from deepspeed.accelerator import get_accelerator
-from deepspeed.ops.op_builder import CPUAdamBuilder, FusedLambBuilder
+from deepspeed.ops.op_builder import CPUAdamBuilder, FusedLambBuilder, FusedAdamBuilder
+from unit.util import hpu_lazy_enabled
 from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer
 
 try:
@@ -26,6 +27,7 @@ if torch.half not in get_accelerator().supported_dtypes():
     pytest.skip(f"fp16 not supported, valid dtype: {get_accelerator().supported_dtypes()}", allow_module_level=True)
 
 
+@pytest.mark.skipif(not deepspeed.ops.__compatible_ops__[FusedLambBuilder.NAME], reason="lamb is not compatible")
 class TestLambFP32GradClip(DistributedTest):
     world_size = 2
 
@@ -60,6 +62,7 @@ class TestLambFP32GradClip(DistributedTest):
             model.step()
 
 
+@pytest.mark.skipif(not deepspeed.ops.__compatible_ops__[FusedLambBuilder.NAME], reason="lamb is not compatible")
 class TestLambFP16(DistributedTest):
     world_size = 2
 
@@ -207,6 +210,8 @@ class TestFP16OptimizerForMoE(DistributedTest):
             engine.backward(loss)
             engine.step()
 
+    @pytest.mark.skipif(not deepspeed.ops.__compatible_ops__[FusedAdamBuilder.NAME],
+                        reason="fused adam is not compatible")
     def test_fused_gradnorm(self, monkeypatch):
         if not get_accelerator().is_fp16_supported():
             pytest.skip("fp16 is not supported")
@@ -240,6 +245,7 @@ class TestFP16OptimizerForMoE(DistributedTest):
             engine.backward(loss)
             engine.step()
 
+    @pytest.mark.skipif(not deepspeed.ops.__compatible_ops__[FusedLambBuilder.NAME], reason="lamb is not compatible")
     @pytest.mark.parametrize("fused_lamb_legacy", [(False), (True)])
     @pytest.mark.skipif(not deepspeed.ops.__compatible_ops__[FusedLambBuilder.NAME],
                         reason="FusedLambBuilder has not been implemented on this system.")
@@ -613,6 +619,9 @@ class TestZeroSupportedClientOptimizer(DistributedTest):
         hidden_dim = 10
 
         model = SimpleModel(hidden_dim)
+        if hpu_lazy_enabled():
+            device = get_accelerator().device_name()
+            model.to(device)
         client_optimizer = optimizer_constructor(params=model.parameters())
         model, _, _, _ = deepspeed.initialize(config=config_dict, model=model, optimizer=client_optimizer)
 
@@ -748,6 +757,9 @@ class TestZeroEmptyGrad(DistributedTest):
         hidden_dim = 10
 
         model = SimpleModel(hidden_dim)
+        if hpu_lazy_enabled():
+            device = get_accelerator().device_name()
+            model.to(device)
         optimizer = torch.optim.Adam(model.parameters())
         model, _, _, _ = deepspeed.initialize(config=config_dict, model=model, optimizer=optimizer)
         data_loader = random_dataloader(model=model, total_samples=50, hidden_dim=hidden_dim, device=model.device)

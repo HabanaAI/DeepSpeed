@@ -66,6 +66,7 @@ def rel_diff(A, B):
 class TestPipeCifar10(DistributedTest):
     world_size = 4
 
+    @pytest.mark.skip('[SW-233407] CIFAR dataset corrupted')
     def test_pipe_base(self, topo_config):
         skip_on_arch(min_arch=7)
         topo = PipeTopo(**topo_config)
@@ -110,7 +111,7 @@ class TestPipeCifar10(DistributedTest):
     #     for p1, p2 in zip(model1.parameters(), model2.parameters()):
     #         if p1.data.ne(p2.data).sum() > 0:
     #             assert False, f"model params not equal"
-
+    @pytest.mark.skip('[SW-233407] CIFAR dataset corrupted')
     def test_pipe_use_reentrant(self, topo_config):
         skip_on_arch(min_arch=7)
 

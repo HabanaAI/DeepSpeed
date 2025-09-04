@@ -170,7 +170,7 @@ class InferenceEngine(Module):
         is_meta_device = hasattr(self.module, "device") and self.module.device.type == 'meta'
         if is_meta_device:
             self.module.to_empty(device=device)
-        else:
+        elif not config.keep_module_on_host:
             self.module.to(device)
 
         if config.tensor_parallel.tp_size > 1:
@@ -178,7 +178,9 @@ class InferenceEngine(Module):
             dist.broadcast(_rng_state, 0)
             get_accelerator().set_rng_state(_rng_state.cpu())
 
-        if config.tensor_parallel.tp_size > 1:
+        if config.enable_cuda_graph and get_accelerator().device_name() == 'hpu':
+            self.module = get_accelerator().wrap_in_hpu_graph(self.module)
+        elif config.tensor_parallel.tp_size > 1:
             assert not config.enable_cuda_graph, "Cuda graph is not supported for model parallelism"
 
         # Check if local CUDA graphs can be created in replacement modules
@@ -584,7 +586,8 @@ class InferenceEngine(Module):
             **kwargs: variable length keyword arguments
         """
         start = None
-        if self.model_profile_enabled and get_accelerator().device_name() == 'cuda' and self._config.enable_cuda_graph:
+        if self.model_profile_enabled and (get_accelerator().device_name() == 'cuda' or get_accelerator().device_name() == 'hpu') and \
+           self._config.enable_cuda_graph:
             get_accelerator().synchronize()
             start = time.time()
 

@@ -16,7 +16,10 @@ from deepspeed.inference.v2.modules.configs import DSSelfAttentionConfig, Positi
 from deepspeed.inference.v2.modules.interfaces import DSSelfAttentionRegistry, DSSelfAttentionBase
 
 from ..kernels.ragged_ops.ragged_testing_utils import build_batch_and_manager
-from ...v2.inference_test_utils import allclose
+from ...v2.inference_test_utils import allclose, skip_on_inference_v2
+
+pytestmark = pytest.mark.skipif(skip_on_inference_v2(),
+                                reason=f'Inference V2 not supported by {get_accelerator().device_name()}.')
 
 try:
     from flash_attn.flash_attn_interface import flash_attn_varlen_func

@@ -203,6 +203,12 @@ class BaseTransformerContainer(ABC):
         self._4hh_b = _4hh_b
 
     def set_layernorm(self, attn_nw, attn_nb, input_nw, input_nb):
+        #TODO SW-164572: remove below mark_step WA once SW-164573 is resolved.
+        if get_accelerator().device_name() == 'hpu':
+            import habana_frameworks.torch.hpu as thpu
+            if thpu.is_initialized():
+                import habana_frameworks.torch.core as htcore
+                htcore.mark_step()
         self.attn_nw = attn_nw
         self.attn_nb = attn_nb
         self.input_nw = input_nw

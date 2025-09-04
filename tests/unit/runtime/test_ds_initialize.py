@@ -11,7 +11,7 @@ from torch.optim.lr_scheduler import _LRScheduler, LambdaLR
 
 from unit.simple_model import SimpleModel, random_dataloader
 from unit.common import DistributedTest
-from unit.util import bf16_required_version_check, required_amp_check
+from unit.util import bf16_required_version_check, required_amp_check, hpu_lazy_enabled
 
 import deepspeed
 from deepspeed.ops.adam import FusedAdam
@@ -230,6 +230,9 @@ class TestOptimizerImplementation(DistributedTest):
 
         hidden_dim = 10
         model = SimpleModel(hidden_dim)
+        # TODO: SW-145674 remove this WA when SW-145671 is resolved.
+        if hpu_lazy_enabled():
+            model.to(get_accelerator().device_name())
         model_parameters = list(model.parameters())
 
         if key in is_supported:

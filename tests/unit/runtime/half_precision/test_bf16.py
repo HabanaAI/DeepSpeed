@@ -10,7 +10,7 @@ from deepspeed.ops.adam import FusedAdam
 from unit.common import DistributedTest
 from deepspeed.ops.op_builder import CPUAdamBuilder
 from unit.simple_model import SimpleModel, SimpleOptimizer, random_dataloader
-from unit.util import bf16_required_version_check
+from unit.util import bf16_required_version_check, hpu_lazy_enabled
 from deepspeed import comm as dist
 from deepspeed.accelerator import get_accelerator
 
@@ -197,6 +197,9 @@ class TestZeroSupportedClientOptimizer(DistributedTest):
         hidden_dim = 10
 
         model = SimpleModel(hidden_dim)
+        if hpu_lazy_enabled():
+            device = get_accelerator().device_name()
+            model.to(device)
         client_optimizer = optimizer_constructor(params=model.parameters())
         model, _, _, _ = deepspeed.initialize(config=config_dict, model=model, optimizer=client_optimizer)
 
@@ -275,6 +278,9 @@ class TestZeroEmptyGrad(DistributedTest):
         hidden_dim = 10
 
         model = SimpleModel(hidden_dim)
+        if hpu_lazy_enabled():
+            device = get_accelerator().current_device_name()
+            model.to(device)
         optimizer = torch.optim.Adam(model.parameters())
         model, _, _, _ = deepspeed.initialize(config=config_dict, model=model, optimizer=optimizer)
         data_loader = random_dataloader(model=model,
@@ -300,9 +306,10 @@ class TestZeroDtypeCocktail(DistributedTest):
                     " DeepSpeed BFloat16 tests need torch >= 1.10, NCCL >= 2.10.3, CUDA > =11.0 and HW support for BFloat16 to run correctly"
                 )
 
-        if comp_type == torch.float16 or comm_type == torch.float16:
-            if not get_accelerator().is_fp16_supported():
-                pytest.skip("fp16 is not supported")
+        if comm_type and (comp_type not in get_accelerator().supported_dtypes()
+                          or comm_type not in get_accelerator().supported_dtypes()):
+            pytest.skip(
+                f"comp_type:{comp_type}, comm_type:{comm_type} not supported by {get_accelerator().device_name()}.")
 
         type_str = {torch.float16: "fp16", torch.bfloat16: "bf16"}
 
@@ -326,6 +333,12 @@ class TestZeroDtypeCocktail(DistributedTest):
         hidden_dim = 10
 
         model = SimpleModel(hidden_dim)
+        if hpu_lazy_enabled():
+            # TODO: remove this when the following is resolved:
+            # https://jira.habana-labs.com/browse/SW-137450
+            config_dict["fp16"]["initial_scale_power"] = 30
+            device = get_accelerator().current_device_name()
+            model.to(device)
         optimizer = torch.optim.Adam(model.parameters())
         model, _, _, _ = deepspeed.initialize(config=config_dict, model=model, optimizer=optimizer)
         data_loader = random_dataloader(model=model,

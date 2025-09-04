@@ -39,7 +39,7 @@ def _apply_forward_and_backward_to_tensors_only(module, forward_function, backwa
 
 class ZeROOrderedDict(OrderedDict):
 
-    def __init__(self, parent_module, *args, **kwargs):
+    def __init__(self, parent_module=None, *args, **kwargs):
         """A replacement for ``collections.OrderedDict`` to detect external ZeRO params.
 
         Args:
@@ -135,6 +135,7 @@ class DeepSpeedZeRoOffload(object):
         self.persistent_parameters = self.mark_persistent_parameters(self.param_numel_persistence_threshold,
                                                                      self.model_persistence_threshold)
 
+        self.param_coordinators = {}
         self._prefetch_bucket_sz = int(prefetch_bucket_size)
         self._max_reuse_distance_in_numel = int(max_reuse_distance)
         self._max_available_parameters_in_numel = int(max_live_parameters)
@@ -142,20 +143,11 @@ class DeepSpeedZeRoOffload(object):
         ) if overlap_comm else get_accelerator().default_stream()
 
         if not hasattr(module, "ds_inflight_param_registry"):
-            module.ds_inflight_param_registry = InflightParamRegistry()
+            module.ds_inflight_param_registry = dict()
+            # we need two registries, one for training and one for eval. They will be used when creating PartitionedParameterCoordinator
+            module.ds_inflight_param_registry[True] = InflightParamRegistry()
+            module.ds_inflight_param_registry[False] = InflightParamRegistry()
         self.__inflight_param_registry = module.ds_inflight_param_registry
-
-        self.param_coordinator = PartitionedParameterCoordinator(
-            prefetch_bucket_sz=self._prefetch_bucket_sz,
-            max_reuse_distance_in_numel=self._max_reuse_distance_in_numel,
-            max_available_parameters_in_numel=self._max_available_parameters_in_numel,
-            allgather_stream=self.__allgather_stream,
-            inflight_param_registry=self.__inflight_param_registry,
-            prefetch_nvme=self.offload_device == OffloadDeviceEnum.nvme,
-            timers=self.timers,
-            zero_quantized_weights=self.zero_quantized_weights,
-            zero_quantized_nontrainable_weights=self.zero_quantized_nontrainable_weights,
-        )
 
         if zero_module_granularity_threshold > 0:
             self.min_granularity_value = sys.maxsize
@@ -166,7 +158,6 @@ class DeepSpeedZeRoOffload(object):
 
         self.forward_hooks = []
         self.backward_hooks = []
-
         self.setup_zero_stage3_hooks()
         print_rank_0(
             f'Created module hooks: forward = {len(self.forward_hooks)}, backward = {len(self.backward_hooks)}',
@@ -179,13 +170,26 @@ class DeepSpeedZeRoOffload(object):
         """Partitioning Parameters that were not partitioned usually if parameters
         of modules whose input parameters do not require grad computation do not
         trigger post call and will therefore will remain unpartitioned"""
-        self.get_param_coordinator().release_and_reset_all(self.module)
+        self.get_param_coordinator(training=self.module.training).release_and_reset_all(self.module)
         for param in iter_params(self.module, recurse=True):
             if param.ds_status != ZeroParamStatus.NOT_AVAILABLE:
                 raise RuntimeError(f"{param.ds_summary()} expected to be released")
 
-    def get_param_coordinator(self):
-        return self.param_coordinator
+    def get_param_coordinator(self, training):
+        if not training in self.param_coordinators:
+            self.param_coordinators[training] = PartitionedParameterCoordinator(
+                prefetch_bucket_sz=self._prefetch_bucket_sz,
+                max_reuse_distance_in_numel=self._max_reuse_distance_in_numel,
+                max_available_parameters_in_numel=self._max_available_parameters_in_numel,
+                allgather_stream=self.__allgather_stream,
+                inflight_param_registry=self.__inflight_param_registry[training],
+                prefetch_nvme=self.offload_device == OffloadDeviceEnum.nvme,
+                timers=self.timers,
+                zero_quantized_weights=self.zero_quantized_weights,
+                zero_quantized_nontrainable_weights=self.zero_quantized_nontrainable_weights,
+            )
+
+        return self.param_coordinators[training]
 
     def empty_partition_cache(self):
         self.partition_all_parameters()
@@ -233,14 +237,14 @@ class DeepSpeedZeRoOffload(object):
 
         #reset step if in inference mode
         @instrument_w_nvtx
-        def _start_of_forward_hook(module, *args):
+        def _end_of_forward_hook(module, *args):
 
-            self.get_param_coordinator().reset_step()
-
-        self.module.register_forward_pre_hook(_start_of_forward_hook)
+            if not torch._C.is_grad_enabled():
+                self.get_param_coordinator(training=False).reset_step()
 
         #likely one of them should be enough but just to be safe
         self._register_hooks_recursively(self.module)
+        self.module.register_forward_hook(_end_of_forward_hook)
 
         # Add top module to stack trace
         global FWD_MODULE_STACK
@@ -334,39 +338,6 @@ class DeepSpeedZeRoOffload(object):
 
         def _pre_backward_module_hook(module, inputs, output):
 
-            if not hasattr(module, "pre_bwd_fn"):
-
-                @instrument_w_nvtx
-                def _run_before_backward_function(sub_module):
-                    # some models (e.g. Albert) may run multiple forwards on the same layer in a loop
-                    # before doing backwards, so each backward will need a pre-fetch - using reference
-                    # counting to support this scenario
-                    #print(f"COUNTER before: {sub_module.applied_pre_backward_ref_cnt}")
-                    if sub_module.applied_pre_backward_ref_cnt > 0:
-                        self.pre_sub_module_backward_function(sub_module)
-                        sub_module.applied_pre_backward_ref_cnt -= 1
-                    #print(f"COUNTER after: {sub_module.applied_pre_backward_ref_cnt}")
-
-                class PreBackwardFunctionForModule(torch.autograd.Function):
-
-                    @staticmethod
-                    def forward(ctx, outputs):
-                        # Capture `module` and _run_before_backward_function
-                        ctx.module = module
-                        ctx.pre_backward_function = _run_before_backward_function
-                        if not hasattr(ctx.module, "applied_pre_backward_ref_cnt"):
-                            ctx.module.applied_pre_backward_ref_cnt = 0
-                        ctx.module.applied_pre_backward_ref_cnt += 1
-                        outputs = outputs.detach()
-                        return outputs
-
-                    @staticmethod
-                    def backward(ctx, *args):
-                        ctx.pre_backward_function(ctx.module)
-                        return args
-
-                module.pre_bwd_fn = PreBackwardFunctionForModule
-
             return apply_to_tensors_only(module.pre_bwd_fn.apply,
                                          output,
                                          warning_msg_fn=_bwd_hook_unexpected_inputs_msg)
@@ -395,41 +366,6 @@ class DeepSpeedZeRoOffload(object):
             if not hasattr(module, "ds_grads_remaining"):
                 module.ds_grads_remaining = 0
 
-            if not hasattr(module, "post_bwd_fn"):
-
-                @instrument_w_nvtx
-                def _run_after_backward_function(sub_module):
-                    if sub_module.ds_grads_remaining == 0:
-                        self.post_sub_module_backward_function(sub_module)
-
-                class PostBackwardFunctionModule(torch.autograd.Function):
-
-                    @staticmethod
-                    def forward(ctx, output):
-                        ctx.module = module
-                        if output.requires_grad:
-                            #TODO SOME TIMES post backward does not seem to be triggered debug in detail
-                            #Should only cause increase in memory not correctness issue
-                            #if output.grad_fn.__class__.__name__ == 'ViewBackward':
-                            #    ctx.view=True
-                            #    print(f"Warning view tensor for input to module : {module.__class__.__name__}. Backward hooks may not trigger properly")
-                            #assert len(module.parameters(recurse=False)), "The input tensor to the module is a view, and autograd Function or register_hook is not triggered with view tensors."
-                            #if module.ds_grads_remaining == 0:
-                            #    print(f"Before Forward: {ctx.module.__class__.__name__}")
-                            module.ds_grads_remaining += 1
-                            ctx.post_backward_function = _run_after_backward_function
-                        output = output.detach()
-                        return output
-
-                    @staticmethod
-                    def backward(ctx, *args):
-                        ctx.module.ds_grads_remaining = ctx.module.ds_grads_remaining - 1
-                        if ctx.module.ds_grads_remaining == 0:
-                            ctx.post_backward_function(ctx.module)
-                        return args
-
-                module.post_bwd_fn = PostBackwardFunctionModule
-
             return apply_to_tensors_only(module.post_bwd_fn.apply,
                                          inputs,
                                          warning_msg_fn=_bwd_hook_unexpected_inputs_msg)
@@ -441,9 +377,77 @@ class DeepSpeedZeRoOffload(object):
         self.forward_hooks.append(module.register_forward_hook(_post_forward_module_hook))
 
         # Pre backward hook
+        if not hasattr(module, "pre_bwd_fn"):
+
+            @instrument_w_nvtx
+            def _run_before_backward_function(sub_module):
+                # some models (e.g. Albert) may run multiple forwards on the same layer in a loop
+                # before doing backwards, so each backward will need a pre-fetch - using reference
+                # counting to support this scenario
+                #print(f"COUNTER before: {sub_module.applied_pre_backward_ref_cnt}")
+                if sub_module.applied_pre_backward_ref_cnt > 0:
+                    self.pre_sub_module_backward_function(sub_module)
+                    sub_module.applied_pre_backward_ref_cnt -= 1
+                #print(f"COUNTER after: {sub_module.applied_pre_backward_ref_cnt}")
+
+            class PreBackwardFunctionForModule(torch.autograd.Function):
+
+                @staticmethod
+                def forward(ctx, outputs):
+                    # Capture `module` and _run_before_backward_function
+                    ctx.module = module
+                    ctx.pre_backward_function = _run_before_backward_function
+                    if not hasattr(ctx.module, "applied_pre_backward_ref_cnt"):
+                        ctx.module.applied_pre_backward_ref_cnt = 0
+                    ctx.module.applied_pre_backward_ref_cnt += 1
+                    outputs = outputs.detach()
+                    return outputs
+
+                @staticmethod
+                def backward(ctx, *args):
+                    ctx.pre_backward_function(ctx.module)
+                    return args
+
+            module.pre_bwd_fn = PreBackwardFunctionForModule
+
         self.backward_hooks.append(module.register_forward_hook(_pre_backward_module_hook))
 
         # post backward hook
+        if not hasattr(module, "post_bwd_fn"):
+
+            @instrument_w_nvtx
+            def _run_after_backward_function(sub_module):
+                if sub_module.ds_grads_remaining == 0:
+                    self.post_sub_module_backward_function(sub_module)
+
+            class PostBackwardFunctionModule(torch.autograd.Function):
+
+                @staticmethod
+                def forward(ctx, output):
+                    ctx.module = module
+                    if output.requires_grad:
+                        #TODO SOME TIMES post backward does not seem to be triggered debug in detail
+                        #Should only cause increase in memory not correctness issue
+                        #if output.grad_fn.__class__.__name__ == 'ViewBackward':
+                        #    ctx.view=True
+                        #    print(f"Warning view tensor for input to module : {module.__class__.__name__}. Backward hooks may not trigger properly")
+                        #assert len(module.parameters(recurse=False)), "The input tensor to the module is a view, and autograd Function or register_hook is not triggered with view tensors."
+                        #if module.ds_grads_remaining == 0:
+                        #    print(f"Before Forward: {ctx.module.__class__.__name__}")
+                        module.ds_grads_remaining += 1
+                        ctx.post_backward_function = _run_after_backward_function
+                    output = output.detach()
+                    return output
+
+                @staticmethod
+                def backward(ctx, *args):
+                    ctx.module.ds_grads_remaining = ctx.module.ds_grads_remaining - 1
+                    if ctx.module.ds_grads_remaining == 0:
+                        ctx.post_backward_function(ctx.module)
+                    return args
+
+            module.post_bwd_fn = PostBackwardFunctionModule
+
         self.backward_hooks.append(module.register_forward_pre_hook(_post_backward_module_hook))
 
     @torch.no_grad()
@@ -453,7 +457,7 @@ class DeepSpeedZeRoOffload(object):
         global FWD_MODULE_STACK
         FWD_MODULE_STACK.append(sub_module)
 
-        param_coordinator = self.get_param_coordinator()
+        param_coordinator = self.get_param_coordinator(training=sub_module.training)
         param_coordinator.trace_prologue(sub_module)
         if param_coordinator.is_record_trace():
             param_coordinator.record_module(sub_module)
@@ -466,7 +470,7 @@ class DeepSpeedZeRoOffload(object):
         see_memory_usage(f"After sub module function {sub_module.__class__.__name__} {sub_module.id} before release",
                          force=False)
 
-        param_coordinator = self.get_param_coordinator()
+        param_coordinator = self.get_param_coordinator(training=sub_module.training)
         param_coordinator.release_sub_module(sub_module)
 
         see_memory_usage(f"After sub module function {sub_module.__class__.__name__}  {sub_module.id} after release",
@@ -474,8 +478,8 @@ class DeepSpeedZeRoOffload(object):
 
     @torch.no_grad()
     def pre_sub_module_backward_function(self, sub_module):
-        # assert sub_module.training, "backward pass is invalid for module in evaluation mode"
-        param_coordinator = self.get_param_coordinator()
+        assert sub_module.training, "backward pass is invalid for module in evaluation mode"
+        param_coordinator = self.get_param_coordinator(training=True)
         param_coordinator.trace_prologue(sub_module)
         if param_coordinator.is_record_trace():
             param_coordinator.record_module(sub_module)
@@ -483,12 +487,12 @@ class DeepSpeedZeRoOffload(object):
 
     @torch.no_grad()
     def post_sub_module_backward_function(self, sub_module):
-        # assert sub_module.training, "backward pass is invalid for module in evaluation mode"
+        assert sub_module.training, "backward pass is invalid for module in evaluation mode"
         see_memory_usage(
             f"After sub module backward function {sub_module.__class__.__name__} {sub_module.id} before release",
             force=False)
 
-        self.get_param_coordinator().release_sub_module(sub_module)
+        self.get_param_coordinator(training=True).release_sub_module(sub_module)
 
         see_memory_usage(
             f"After sub module backward function {sub_module.__class__.__name__} {sub_module.id} after release",

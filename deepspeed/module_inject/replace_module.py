@@ -93,8 +93,10 @@ def generic_injection(module, dtype=None, enable_cuda_graph=True):
             return child
         if len(policy_attn) == 5:
             qkvw, attn_ow, attn_ob, hidden_size, heads = policy_attn
+            qw, kw, vw = torch.empty(0), torch.empty(0), torch.empty(0)
         else:
             qw, kw, vw, attn_ow, attn_ob, hidden_size, heads = policy_attn
+            qkvw = torch.empty(0)
 
         config = transformer_inference.DeepSpeedInferenceConfig(
             hidden_size=hidden_size,
@@ -268,7 +270,8 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
         #mp_replace = ReplaceWithTensorSlicing(mp_group=config.tensor_parallel.tp_group)
 
         # 1. Create AutoTP object
-        _autotp = AutoTP(module, all_reduce_linears, prefix, state_dict, linear_layer_setting, orig_layer_impl)
+        _autotp = AutoTP(module, all_reduce_linears, prefix, state_dict, linear_layer_setting, orig_layer_impl,
+                         config.keep_module_on_host)
 
         # 2. Set the tensor parallelism config
         _autotp.set_tensor_parallel_config(config.tensor_parallel.tp_size, config.tensor_parallel.tp_group)
@@ -312,22 +315,15 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
         return _autotp._replace_module(module)
 
     def replace_fn(child, _policy, layer_id=0, prefix="", state_dict=None):
-        training = False  # todo: refactor this part to go in the config
-        if training:
-            # copy relevant state from child -> new module
-            new_module = replace_with_policy(child, _policy, config.triangular_masking)
-
+        # copy relevant state from child -> new module
+        if config.replace_with_kernel_inject:
+            new_module = replace_with_policy(child,
+                                             _policy,
+                                             config.triangular_masking,
+                                             inference=True,
+                                             layer_id=layer_id)
         else:
-            # copy relevant state from child -> new module
-            if config.replace_with_kernel_inject:
-                new_module = replace_with_policy(child,
-                                                 _policy,
-                                                 config.triangular_masking,
-                                                 inference=True,
-                                                 layer_id=layer_id)
-            else:
-                new_module = replace_wo_policy(child, _policy, prefix=prefix, state_dict=state_dict)
-
+            new_module = replace_wo_policy(child, _policy, prefix=prefix, state_dict=state_dict)
         return new_module
 
     def set_lm_head(module):

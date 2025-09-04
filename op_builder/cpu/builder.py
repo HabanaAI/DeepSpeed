@@ -30,11 +30,7 @@ class CPUOpBuilder(OpBuilder):
         return cpp_ext
 
     def cxx_args(self):
-        args = ['-O3', '-g', '-Wno-reorder']
-        CPU_ARCH = self.cpu_arch()
-        SIMD_WIDTH = self.simd_width()
-        args += [CPU_ARCH, '-fopenmp', SIMD_WIDTH]
-        return args
+        return ['-O3', '-g', '-Wno-reorder']
 
     def libraries_args(self):
         return []

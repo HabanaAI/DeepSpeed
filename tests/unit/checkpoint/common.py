@@ -17,6 +17,7 @@ from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from unit.common import preferred_dtype
 from unit.simple_model import *
 from unittest.mock import MagicMock, patch
+from unit.util import hpu_lazy_enabled
 
 
 def compare_deepspeed_states(saved_model, loaded_model):
@@ -155,6 +156,8 @@ def create_moe_param_groups(model):
 
 
 def create_deepspeed_model(config_dict, model, base_optimizer):
+    if hpu_lazy_enabled():
+        model.to(get_accelerator().device_name())
     ds_model, _, _, _ = deepspeed.initialize(config=config_dict,
                                              model=model,
                                              model_parameters=create_moe_param_groups(model),
@@ -174,11 +177,14 @@ def checkpoint_correctness_verification(config_dict,
                                         empty_tag=False,
                                         seq_dataloader=False,
                                         load_module_only=False,
-                                        dtype=None):
+                                        dtype=None,
+                                        compile_mode=False):
     if dtype == None:
         dtype = preferred_dtype()
 
     ds_model = create_deepspeed_model(config_dict=config_dict, model=models[0], base_optimizer=base_optimizers[0])
+    if compile_mode:
+        ds_model.compile()
 
     if seq_dataloader:
         data_loader = sequence_dataloader(model=ds_model,

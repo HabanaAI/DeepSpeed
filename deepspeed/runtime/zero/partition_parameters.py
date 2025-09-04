@@ -1481,7 +1481,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 assert param.ds_tensor.final_location == OffloadDeviceEnum.nvme and param.ds_status == ZeroParamStatus.NOT_AVAILABLE
                 swap_in_list.append(param)
             if param.ds_tensor.status == PartitionedParamStatus.INFLIGHT:
-                assert param.ds_tensor.final_location == OffloadDeviceEnum.nvme and param.ds_status == ZeroParamStatus.NOT_AVAILABLE
+                assert param.ds_tensor.final_location == OffloadDeviceEnum.nvme and param.ds_status == ZeroParamStatus.INFLIGHT
                 swap_in_flight.append(param)
         if len(swap_in_list) > 0:
             swap_in_list[0].nvme_swapper.swap_in(swap_in_list, async_op=False)
@@ -1891,7 +1891,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         tensor_size = partition_size * self.num_partitions
         flat_tensor = torch.empty(tensor_size, dtype=param_list[0].ds_tensor.dtype, device=self.local_device)
-        flat_tensor.requires_grad = False
         partitions = []
         for i in range(self.num_partitions):
             start = partition_size * i
@@ -1913,7 +1912,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             flat_scale_tensor = torch.empty(scale_tensor_size,
                                             dtype=param_list[0].ds_tensor.ds_quant_scale.dtype,
                                             device=self.local_device)
-            flat_scale_tensor.requires_grad = False
             scale_partitions = []
             for i in range(self.world_size):
                 start = scale_tensor_size * i

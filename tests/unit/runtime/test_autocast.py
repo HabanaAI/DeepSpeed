@@ -25,6 +25,7 @@ class TestAutoCastDisable(DistributedTest):
         output = ds_linear(input)
         assert output.dtype == ds_linear.weight.dtype
 
+    @pytest.mark.skipif(get_accelerator().amp() is None, reason='amp is not installed')
     def test_disable_autocast_linear(self, half_op):
         amp = get_accelerator().amp()
 

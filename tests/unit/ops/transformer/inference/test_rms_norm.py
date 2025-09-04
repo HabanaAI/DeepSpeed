@@ -68,7 +68,7 @@ def pre_ref_implementation(vals, residual, gamma, epsilon):
 @pytest.mark.parametrize("batch", [1, 32])
 @pytest.mark.parametrize("seq_len", [1, 128])
 @pytest.mark.parametrize("channels", [384, 512, 768, 1024, 2048, 8192, 14432])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("dtype", get_dtypes())
 def test_pre_norm(batch, seq_len, channels, dtype):
     device = get_accelerator().current_device_name()
     vals = torch.randn((batch, seq_len, channels), dtype=dtype, device=device)
